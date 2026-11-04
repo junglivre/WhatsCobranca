@@ -25,6 +25,12 @@ WAHA_SESSION=SET_YOUR_WAHA_SESSION
 OPERATOR_LID=SET_YOUR_OPERATOR_LID
 OPERATOR_PHONE=SET_YOUR_OPERATOR_PHONE
 N8N_ENCRYPTION_KEY=$n8n_key
+# Audio (Fase 4): fill GROQ_API_KEY to enable voice notes; empty = audio disabled.
+GROQ_API_KEY=
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_STT_MODEL=whisper-large-v3
+GROQ_LLM_MODEL=llama-3.3-70b-versatile
+WAHA_MEDIA_MAX_BYTES=16777216
 EOF
 chmod 600 "$env_file"
 echo "Created .env with mode 600. Fill WAHA_API_KEY/WAHA_BASE_URL/WAHA_SESSION/OPERATOR_LID/OPERATOR_PHONE before starting the operational stack."

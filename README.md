@@ -15,11 +15,11 @@ WhatsApp → WAHA → webhook assinado (HMAC-SHA512) → inbox PostgreSQL
                                            outbox PostgreSQL → WAHA → WhatsApp
 ```
 
-Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico. **Fora de escopo:** extração por IA/LLM, transcrição de áudio, controle de estoque, cobrança (Asaas) e emissão fiscal — a conversa é 100% guiada por regras determinísticas, sem chamada a modelo de linguagem.
+Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico e, desde a Fase 4, notas de voz transcritas e interpretadas por IA (ver [Áudio (Fase 4)](#áudio-fase-4)). **Fora de escopo:** controle de estoque, cobrança (Asaas) e emissão fiscal — a gramática de TEXTO continua 100% determinística; IA só entra no fluxo de áudio.
 
-## Por que a conversa não usa IA
+## Por que a conversa (de texto) não usa IA
 
-É uma escolha deliberada, não uma limitação temporária: validar a cadeia WAHA → Core API → PostgreSQL com uma máquina de estados determinística, auditável e testável antes de acoplar qualquer camada probabilística. Extração por IA é um ponto de extensão natural (ver `core-api/src/domain.ts`), mas exige sua própria validação de confiabilidade — não faz parte deste ciclo.
+Foi uma escolha deliberada: validar a cadeia WAHA → Core API → PostgreSQL com uma máquina de estados determinística, auditável e testável antes de acoplar qualquer camada probabilística. A Fase 4 adicionou IA num escopo fechado — transcrição (Groq Whisper) e extração estruturada (Groq LLM) exclusivamente para notas de voz — e o resultado da IA nunca executa nada sozinho: ele apenas pré-preenche o mesmo fluxo guiado determinístico, que sempre termina pedindo confirmação explícita ao operador.
 
 ## Pré-requisitos
 
@@ -92,13 +92,48 @@ Sem IA — gramática fixa, em português:
 
 Dinheiro é sempre `Int` em centavos — nunca ponto flutuante. `150`, `150,00` e `R$ 150` são aceitos; valores negativos, ambíguos ou com mais de duas casas decimais são rejeitados sem alterar o estado.
 
+## Áudio (Fase 4)
+
+Notas de voz passam por **Groq Whisper** (STT) e **Groq LLM** antes de entrar no mesmo fluxo guiado do texto.
+
+**Como funciona**
+
+1. Envelope com `hasMedia=true` e `media.mimetype` começando com `audio/`: o Core baixa os bytes de `{WAHA_BASE_URL}/api/files/{session}/{messageId}.oga` (usa só o PATH de `payload.media.url`, nunca o host público da url), autenticando com `X-Api-Key`. Áudio acima de `WAHA_MEDIA_MAX_BYTES` (default 16 MiB) é rejeitado (`AUDIO_TOO_LARGE`) sem transcrever. Mídia não-audio é rejeitada de imediato (`MEDIA_UNSUPPORTED`), sem download.
+2. STT: `POST {GROQ_BASE_URL}/audio/transcriptions` (`model=whisper-large-v3`, `temperature=0`). A transcrição é salva em `messages.transcription` na mesma transação do processamento — **nenhum byte de áudio é persistido**: sem coluna de mídia, sem arquivo em disco; o áudio vive só na memória do processo.
+3. Extração: `POST {GROQ_BASE_URL}/chat/completions` com prompt de sistema fixo (versionado em `core-api/src/groq-prompt.ts`), `temperature=0` e `response_format: json_object`. Saída esperada: `{"intent", "customer_name", "service_description", "service_amount", "materials_amount", "due_date"}` — validada com zod; a IA nunca inventa campo não dito (`null`).
+4. Roteamento do resultado: cliente resolvido como texto (0 → oferta de cadastro; ambíguo → lista; 1 → direto), `service_amount` vira o valor em centavos (matemática inteira validada por range), `due_date` (YYYY-MM-DD) vira `service_orders.due_date` e aparece no resumo como `Vence: DD/MM/AAAA`, `materials_amount` vira o valor de materiais. O fluxo **sempre** termina em `AGUARDANDO_CONFIRMACAO` com resumo + `sim`/`cancelar` explícitos — a IA nunca confirma, cria ou cobra nada sozinha.
+
+**Limites e fallbacks determinísticos** (o operador nunca é bloqueado pela IA):
+
+- `GROQ_API_KEY` ausente → resposta fixa "áudio não está configurado nesta instalação" (`AUDIO_NOT_CONFIGURED`), sem chamada externa.
+- JSON/schema inválido na extração → a transcrição vira a descrição do fluxo guiado normal, com resposta "Ouvi: <transcrição>" e pergunta do cliente; nada é criado antes da hora.
+- `intent != REGISTRAR_SERVICO` → resposta explicando o que o bot aceita (`AUDIO_INTENT_IGNORED`).
+- Falha de rede/5xx no STT ou LLM → inbox `PENDING` com as mesmas 5 tentativas limitadas → `FAILED` visível; o ledger de saída deduplica, não há risco de resposta duplicada.
+- Envelope autenticado mas estruturalmente inválido (incluindo nota de voz com `body=null`) → persistido como `webhook_events.state='INVALID'` e respondido **200** — nunca 400, que fazia o WAHA esgotar retry e perder mensagem real.
+
+**Configuração Groq** (zod em `core-api/src/config.ts`; exemplos em `.env.example`):
+
+| Variável | Default | Uso |
+|---|---|---|
+| `GROQ_API_KEY` | *(vazio = áudio desativado)* | Chave da API Groq |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Endpoint OpenAI-compatível |
+| `GROQ_STT_MODEL` | `whisper-large-v3` | Modelo de transcrição |
+| `GROQ_LLM_MODEL` | `llama-3.3-70b-versatile` | Modelo de extração |
+| `WAHA_MEDIA_MAX_BYTES` | `16777216` | Cap de download de mídia (bytes) |
+
+Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`).
+
+**Privacidade:** nenhum byte de áudio é persistido nem vai para disco local — só o texto da transcrição fica no banco (coluna `messages.transcription`). O servidor Groq recebe os bytes por HTTPS e é tratado como processador externo; para instalações sem Groq, o áudio é simplesmente rejeitado sem sair da rede local.
+
+**Limitação conhecida (POC):** OS em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO` que o operador nunca confirma (ou abandona ao iniciar outro atendimento por áudio) ficam abertas no banco — não há comando para cancelar OS por número nem retomar rascunho nesta fase. Elas aparecem nas consultas; cancelamento dirigido por número fica para o próximo ciclo.
+
 ## Verificação isolada
 
 ```sh
 npm run verify
 ```
 
-Roda um projeto Compose separado (`whatscobranca_verify`), ignora o `.env` real (`--env-file /dev/null`), usa um WAHA HTTP falso isolado e nunca chama a API WAHA de verdade. Cobre: HMAC/schema/allowlist, deduplicação sob concorrência, fluxo guiado completo, correção, confirmação idempotente, consulta por cliente/dia, mídia/texto vazio, expiração, workflow n8n importado e ativo processando uma inbox pendente real, recuperação após reiniciar o Core, constraints de unicidade/FK no PostgreSQL, e restauração de backup em banco novo com valores conferidos. Só reseta os três bancos nomeados **whatscobranca_verify\***, nunca o banco operacional.
+Roda um projeto Compose separado (`whatscobranca_verify`), ignora o `.env` real (`--env-file /dev/null`), usa um WAHA HTTP falso isolado e um Groq falso (`scripts/test-groq-server.mjs`, cenários `ok/badjson/hallucinated/timeout/500` com ledger) — nunca chama a API WAHA ou Groq de verdade. As portas fixas da prova (API `18082`, n8n `15678`, PostgreSQL `55433`, proxy `18081`, provedores fake `18090`/`18091`) precisam estar livres; em conflito, ajuste `docker-compose.verify.yml` e as URLs em `scripts/verify-http.mjs`. Cobre: HMAC/schema/allowlist (envelope autenticado inválido persiste `INVALID` com 200), deduplicação sob concorrência (incluindo áudio reentregue), fluxo guiado completo, correção, confirmação idempotente, consulta por cliente/dia, mídia/texto vazio, fluxo de áudio ponta-a-ponta (STT → extração → OS com `due_date` → confirmação), fallbacks determinísticos da IA, cap de mídia, STT 5xx com retry limitado, ausência de `GROQ_API_KEY`, expiração, workflow n8n importado e ativo processando uma inbox pendente real, recuperação após reiniciar o Core, constraints de unicidade/FK no PostgreSQL, e restauração de backup em banco novo com valores conferidos. Só reseta os três bancos nomeados **whatscobranca_verify\***, nunca o banco operacional.
 
 ## Falhas e incerteza
 

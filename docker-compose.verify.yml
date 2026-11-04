@@ -6,9 +6,15 @@ services:
     environment:
       WAHA_BASE_URL: http://waha-test:8090
       WAHA_API_KEY: verify-isolated-key
-    ports: !override ["127.0.0.1:18080:8080"]
+      GROQ_API_KEY: verify-isolated-key
+      GROQ_BASE_URL: http://groq-test:8091
+      GROQ_STT_MODEL: whisper-large-v3
+      GROQ_LLM_MODEL: llama-3.3-70b-versatile
+      WAHA_MEDIA_MAX_BYTES: 65536
+    ports: !override ["127.0.0.1:18082:8080"]
     depends_on:
       waha-test: {condition: service_healthy}
+      groq-test: {condition: service_healthy}
   n8n:
     environment:
       WEBHOOK_URL: http://localhost:15678/
@@ -24,6 +30,18 @@ services:
     ports: !override ["127.0.0.1:18090:8090"]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/health').then(x=>process.exit(x.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  groq-test:
+    image: node:22.18.0-bookworm-slim
+    restart: unless-stopped
+    working_dir: /test
+    volumes: [./scripts/test-groq-server.mjs:/test/server.mjs:ro]
+    command: ["node", "server.mjs"]
+    ports: !override ["127.0.0.1:18091:8091"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8091/health').then(x=>process.exit(x.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 2s
       timeout: 2s
       retries: 30

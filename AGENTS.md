@@ -4,7 +4,7 @@ Instruções para qualquer agente de IA (humano ou não) que for alterar este re
 
 ## O que este projeto é
 
-POC de um assistente de Ordens de Serviço via WhatsApp: WAHA (existente, não gerenciado por este repo) → webhook assinado → Core API (Fastify/TypeScript/Prisma) → PostgreSQL, com n8n só como acionador de um tick durável. Sem IA/LLM na conversa — é uma máquina de estados determinística, proposital, não uma limitação temporária. Sem estoque, cobrança (Asaas) ou emissão fiscal nesta fase.
+POC de um assistente de Ordens de Serviço via WhatsApp: WAHA (existente, não gerenciado por este repo) → webhook assinado → Core API (Fastify/TypeScript/Prisma) → PostgreSQL, com n8n só como acionador de um tick durável. Desde a Fase 4, notas de voz passam por Groq Whisper (STT) + Groq LLM (extração estruturada) e pré-preenchem o fluxo guiado — a gramática de TEXTO continua uma máquina de estados determinística, proposital. Sem estoque, cobrança (Asaas) ou emissão fiscal nesta fase.
 
 Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática de conversa descritas lá são a fonte de verdade do comportamento esperado.
 
@@ -20,6 +20,11 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - **Toda transição de domínio grava `audit_logs`** na mesma transação, com ator (`OPERATOR`/`SYSTEM`) e a mensagem de origem quando houver.
 - **Consultas respondem a partir do PostgreSQL**, nunca do histórico da conversa em memória.
 - **Fuso horário**: "hoje" é sempre `America/Sao_Paulo`, convertido na borda da query a partir de `timestamptz` em UTC.
+- **IA nunca confirma nada sozinha** (limite da seção 9.2 do plano): a saída do LLM é validada com zod e apenas pré-preenche o fluxo guiado determinístico; toda OS nasce em `AGUARDANDO_CONFIRMACAO` e só muda com `sim`/`cancelar` explícitos do operador. Nenhum campo não dito é inventado (`null`), e `due_date` só entra como `YYYY-MM-DD` válido.
+- **Fallback da IA é determinístico**: JSON/schema inválido, `intent != REGISTRAR_SERVICO` ou `GROQ_API_KEY` ausente nunca bloqueiam o operador — transcrição vira descrição do fluxo guiado, intent ignorada responde escopo, sem chave responde "não configurado"; falha de rede/5xx segue a semântica durável de inbox (5 tentativas → `FAILED`).
+- **Envelope autenticado estruturalmente inválido persiste com 200** (`webhook_events.state='INVALID'`, `processed_at`, sem processamento) — nunca 400, que fazia o WAHA (único emissor autenticado) esgotar retry exponencial e perder mensagem real (bug da voz com `body=null`). HMAC inválido continua 401 sem persistir.
+- **Áudio nunca é persistido em disco**: nenhum byte de mídia vai para coluna, arquivo ou log — o download vive só na memória do processo e apenas `messages.transcription` (e `media_mimetype`/`media_path` como metadados text) sobrevive. Download autenticado com `X-Api-Key`, cap `WAHA_MEDIA_MAX_BYTES`, usando só o PATH de `payload.media.url` prefixado com `WAHA_BASE_URL` (nunca o host público da url).
+- **Roteamento de mídia é fechado**: só `mimetype audio/*` segue para o fluxo de áudio (transcrição é autoritativa, body/caption ignorado); mídia sem mimetype ou não-audio é rejeitada (`MEDIA_UNSUPPORTED`) sem download; texto vazio sem mídia continua `EMPTY_TEXT`.
 
 ## Convenções
 

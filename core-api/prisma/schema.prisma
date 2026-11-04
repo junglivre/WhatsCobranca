@@ -33,16 +33,17 @@ model Customer {
   @@map("customers")
 }
 model ServiceOrder {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  number Int @unique
-  customerId String @map("customer_id") @db.Uuid
-  customer Customer @relation(fields:[customerId],references:[id])
-  description String
-  amountCents Int? @map("amount_cents")
-  status String
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(6)
-  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number        Int       @unique
+  customerId    String    @map("customer_id") @db.Uuid
+  customer      Customer  @relation(fields: [customerId], references: [id])
+  description   String
+  amountCents   Int?      @map("amount_cents")
+  dueDate       DateTime? @map("due_date") @db.Date
+  status        String
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  confirmedAt   DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  cancelledAt   DateTime? @map("cancelled_at") @db.Timestamptz(6)
   @@map("service_orders")
 }
 model ConversationState {
@@ -58,32 +59,35 @@ model ConversationState {
   @@map("conversation_states")
 }
 model Message {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  operatorId String @map("operator_id") @db.Uuid
-  operator Operator @relation(fields:[operatorId],references:[id])
-  session String
-  messageId String @map("message_id")
-  replyTo String @map("reply_to")
-  body String?
-  hasMedia Boolean @map("has_media")
-  skippedReason String? @map("skipped_reason")
-  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
-  @@unique([session,messageId])
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operatorId    String   @map("operator_id") @db.Uuid
+  operator      Operator @relation(fields: [operatorId], references: [id])
+  session       String
+  messageId     String   @map("message_id")
+  replyTo       String   @map("reply_to")
+  body          String?
+  hasMedia      Boolean  @map("has_media")
+  mediaMimetype String?  @map("media_mimetype")
+  mediaPath     String?  @map("media_path")
+  transcription String?
+  skippedReason String?  @map("skipped_reason")
+  receivedAt    DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  @@unique([session, messageId])
   @@map("messages")
 }
 model WebhookEvent {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  session String
-  messageId String @map("message_id")
-  messageDbId String @map("message_db_id") @db.Uuid
-  state String @default("PENDING")
-  attempts Int @default(0)
-  lastError String? @map("last_error")
-  raw Json
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  session     String?
+  messageId   String?   @map("message_id")
+  messageDbId String?   @map("message_db_id") @db.Uuid
+  state       String    @default("PENDING")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error")
+  raw         Json
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
-  position BigInt @unique @default(autoincrement())
-  @@unique([session,messageId])
+  position    BigInt    @unique @default(autoincrement())
+  @@unique([session, messageId])
   @@map("webhook_events")
 }
 model OutboundMessage {

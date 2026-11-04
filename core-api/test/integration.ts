@@ -18,15 +18,19 @@ const settings = {
   WAHA_SESSION: 'default',
   OPERATOR_LID: '00000000000000@lid',
   OPERATOR_PHONE: '5511999999999@c.us',
+  GROQ_API_KEY: 'verify-isolated-key',
+  GROQ_STT_MODEL: 'whisper-large-v3',
+  GROQ_LLM_MODEL: 'llama-3.3-70b-versatile',
+  WAHA_MEDIA_MAX_BYTES: '16777216',
   PORT: '8080', // Config requires a positive port; listen({ port: 0 }) selects the actual test port.
 };
 Object.assign(process.env, settings);
 
 type Delivery = { session: string; chatId: string; text: string; providerId: string };
 type DeliveryMode = 'accept' | 'reject400' | 'reject503' | 'lose-response';
-type Payload = { id: string; timestamp: number; from: string; fromMe: boolean; body: string; hasMedia: boolean };
+type Payload = { id: string; timestamp: number; from: string; fromMe: boolean; body: string | null; hasMedia: boolean; media?: { url?: string; filename: string | null; mimetype: string } };
 type Envelope = { id: string; timestamp: number; session: string; event: string; engine: string; payload: Payload };
-type Order = { id: string; number: number; customer_id: string; description: string; amount_cents: number | null; status: string; confirmed_at: Date | null };
+type Order = { id: string; number: number; customer_id: string; description: string; amount_cents: number | null; due_date: Date | null; status: string; confirmed_at: Date | null };
 type State = { pending_action: string | null; payload: Record<string, unknown> | null; service_order_id: string | null; expires_at: Date | null; updated_at: Date };
 type Outbound = { id: string; body: string; status: string; attempts: number; provider_message_id: string | null; last_error: string | null; reply_to: string };
 type Audit = { action: string; entity_type: string; entity_id: string; actor_id: string; source_message_id: string; previous_status: string | null; new_status: string | null; reason: string | null };
@@ -37,7 +41,27 @@ const providerAttempts: Array<{ mode: DeliveryMode; message: Omit<Delivery, 'pro
 let deliveryMode: DeliveryMode = 'accept';
 let nextProviderId = 0;
 const providerErrors: unknown[] = [];
+// Mirrors scripts/test-waha-server.mjs GET /api/files/:sessionId/:fileId so the
+// media flow runs against the same WAHA_BASE_URL used for sendText deliveries.
+const mediaDownloads: Array<{ path: string; bytes: number }> = [];
+const oggScaffold = Buffer.alloc(10 * 1024);
+Buffer.from('OggS', 'binary').copy(oggScaffold, 0);
+const oversizeMedia = Buffer.alloc(200 * 1024, 0x61);
+Buffer.from('OggS', 'binary').copy(oversizeMedia, 0);
 const provider = http.createServer((request, response) => {
+  const fileMatch = /^\/api\/files\/([^/]+)\/([^/]+?)(\.[a-z0-9]+)?$/i.exec(request.url ?? '');
+  if (request.method === 'GET' && fileMatch) {
+    if (request.headers['x-api-key'] !== settings.WAHA_API_KEY) {
+      response.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ error: 'invalid test key' }));
+      return;
+    }
+    const fileId = fileMatch[2]!;
+    const media = fileId.startsWith('oversize') ? oversizeMedia : oggScaffold;
+    mediaDownloads.push({ path: request.url!, bytes: media.length });
+    response.writeHead(200, { 'content-type': 'audio/ogg', 'content-length': String(media.length) });
+    response.end(media);
+    return;
+  }
   let raw = '';
   request.setEncoding('utf8');
   request.on('data', (chunk: string) => { raw += chunk; });
@@ -77,9 +101,19 @@ let baseUrl = '';
 let providerUrl = '';
 let serial = 0;
 const id = (label: string) => `${label}-${++serial}`;
-const envelope = (messageId: string, body: string, extra: Partial<Payload> = {}): Envelope => ({
+const envelope = (messageId: string, body: string | null, extra: Partial<Payload> = {}): Envelope => ({
   id: `envelope-${messageId}`, timestamp: 1793763818, session: settings.WAHA_SESSION, event: 'message', engine: 'NOWEB',
   payload: { id: messageId, timestamp: 1793763818, from: settings.OPERATOR_LID, fromMe: false, body, hasMedia: false, ...extra },
+});
+// Real NOWEB voice note: body=null and media carries an absolute public url whose
+// PATH the core must re-prefix with WAHA_BASE_URL (never fetching the public host).
+const audioMedia = (messageId: string, opts: { mimetype?: string; url?: string; omitUrl?: boolean } = {}): Partial<Payload> => ({
+  hasMedia: true,
+  media: {
+    ...(opts.omitUrl ? {} : { url: opts.url ?? `http://waha-test:8090/api/files/${settings.WAHA_SESSION}/${messageId}.oga` }),
+    filename: null,
+    mimetype: opts.mimetype ?? 'audio/ogg',
+  },
 });
 const signature = (raw: string) => crypto.createHmac('sha512', settings.WAHA_WEBHOOK_SECRET).update(raw).digest('hex');
 
@@ -91,7 +125,7 @@ async function request(path: string, init: RequestInit = {}) {
 async function postRaw(raw: string, hmac = signature(raw)) {
   return request('/webhooks/waha', { method: 'POST', headers: { 'content-type': 'application/json', 'x-webhook-hmac': hmac }, body: raw });
 }
-async function ingest(messageId: string, body: string, extra: Partial<Payload> = {}) {
+async function ingest(messageId: string, body: string | null, extra: Partial<Payload> = {}) {
   const response = await postRaw(JSON.stringify(envelope(messageId, body, extra)));
   assert.equal(response.status, 200, response.text);
 }
@@ -136,8 +170,20 @@ async function pending(action: string | null): Promise<State> {
 }
 async function orders(): Promise<Order[]> {
   return prisma.$queryRawUnsafe<Order[]>(
-    'SELECT id, number, customer_id, description, amount_cents, status, confirmed_at FROM service_orders ORDER BY number',
+    'SELECT id, number, customer_id, description, amount_cents, due_date, status, confirmed_at FROM service_orders ORDER BY number',
   );
+}
+async function audioColumns(messageId: string): Promise<{ transcription: string | null; media_mimetype: string | null; media_path: string | null }> {
+  const [row] = await prisma.$queryRawUnsafe<Array<{ transcription: string | null; media_mimetype: string | null; media_path: string | null }>>(
+    'SELECT transcription, media_mimetype, media_path FROM messages WHERE message_id=$1', messageId,
+  );
+  return row!;
+}
+async function eventRow(messageId: string): Promise<{ state: string; attempts: number }> {
+  const [row] = await prisma.$queryRawUnsafe<Array<{ state: string; attempts: number }>>(
+    'SELECT state, attempts FROM webhook_events WHERE message_id=$1', messageId,
+  );
+  return row!;
 }
 async function audits(messageId: string): Promise<Audit[]> {
   return prisma.$queryRawUnsafe<Audit[]>(
@@ -171,7 +217,136 @@ async function reset() {
   deliveries.length = 0;
   providerAttempts.length = 0;
   deliveryMode = 'accept';
+  mediaDownloads.length = 0;
 }
+
+// ---------------------------------------------------------------------------
+// Groq fake. When GROQ_BASE_URL is injected (compose verify: groq-test:8091,
+// scripts/test-groq-server.mjs) the control calls below hit that service over
+// HTTP; otherwise this in-process mirror with identical routes is used.
+type GroqKind = 'stt' | 'llm';
+type GroqMode = 'ok' | 'badjson' | 'hallucinated' | 'timeout' | '500';
+type GroqLedgerEntry = { kind: GroqKind; mode: GroqMode; model: string | null; bytes: number; at: string };
+type GroqLedger = { modes: Record<GroqKind, GroqMode>; sttQueue: string[]; llmQueue: unknown[]; entries: GroqLedgerEntry[] };
+const groqModes: Record<GroqKind, GroqMode> = { stt: 'ok', llm: 'ok' };
+const sttQueue: string[] = [];
+const llmQueue: Array<Record<string, unknown>> = [];
+const groqEntries: GroqLedgerEntry[] = [];
+const DEFAULT_STT_TEXT = 'Troca da bomba de agua do poo';
+const DEFAULT_LLM = { intent: 'REGISTRAR_SERVICO', customer_name: 'Carlos Pereira', service_description: 'Troca da bomba de agua', service_amount: 150.5, materials_amount: null, due_date: null };
+// Schema-invalid on purpose: due_date violates the YYYY-MM-DD contract, so the
+// core must fall back to the deterministic guided flow instead of trusting it.
+const HALLUCINATED_LLM = { intent: 'REGISTRAR_SERVICO', customer_name: 'Fulano Inventado', service_description: 'Servico que ninguem pediu', service_amount: 999, materials_amount: 1, due_date: 'amanha' };
+
+function parseMultipart(buffer: Buffer, contentType: string | undefined): Record<string, Buffer> | null {
+  const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType ?? '');
+  if (!match) return null;
+  const boundary = `--${(match[1] ?? match[2])!.trim()}`;
+  const parts = buffer.toString('binary').split(boundary).slice(1, -1);
+  const fields: Record<string, Buffer> = {};
+  for (const part of parts) {
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+    const name = /name="([^"]+)"/i.exec(part.slice(0, headerEnd))?.[1];
+    if (name) fields[name] = Buffer.from(part.slice(headerEnd + 4), 'binary').subarray(0, -2);
+  }
+  return fields;
+}
+
+const groqReply = (response: http.ServerResponse, status: number, body: unknown) => {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(body));
+};
+
+const groqFake = http.createServer((request, response) => {
+  const kind: GroqKind | null = request.url === '/audio/transcriptions' ? 'stt' : request.url === '/chat/completions' ? 'llm' : null;
+  if (request.method === 'GET' && request.url === '/health') return groqReply(response, 200, { ok: true, modes: groqModes });
+  if (request.method === 'GET' && request.url === '/ledger') return groqReply(response, 200, { modes: groqModes, sttQueue, llmQueue, entries: groqEntries });
+  if (request.method === 'POST' && request.url === '/reset') {
+    groqModes.stt = 'ok';
+    groqModes.llm = 'ok';
+    sttQueue.length = 0;
+    llmQueue.length = 0;
+    groqEntries.length = 0;
+    return groqReply(response, 200, { ok: true });
+  }
+  if (request.method === 'POST' && request.url === '/scenario') {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as { mode?: GroqMode; endpoint?: GroqKind; stt?: string | string[]; llm?: Record<string, unknown> | Array<Record<string, unknown>> };
+      if (body.mode !== undefined) {
+        if (body.endpoint) groqModes[body.endpoint] = body.mode;
+        else { groqModes.stt = body.mode; groqModes.llm = body.mode; }
+      }
+      if (body.stt !== undefined) sttQueue.push(...(Array.isArray(body.stt) ? body.stt : [body.stt]));
+      if (body.llm !== undefined) llmQueue.push(...(Array.isArray(body.llm) ? body.llm : [body.llm]));
+      groqReply(response, 200, { ok: true, modes: groqModes });
+    });
+    return;
+  }
+  if (request.method === 'POST' && kind) {
+    const authorization = request.headers.authorization;
+    if (authorization !== `Bearer ${settings.GROQ_API_KEY}`) return groqReply(response, 401, { error: 'invalid test key' });
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: Buffer) => chunks.push(chunk));
+    request.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const mode = groqModes[kind];
+      const attempt: GroqLedgerEntry = { kind, mode, model: null, bytes: body.length, at: new Date().toISOString() };
+      if (mode === '500') {
+        groqEntries.push(attempt);
+        return groqReply(response, 500, { error: 'planned test failure' });
+      }
+      if (mode === 'timeout') {
+        groqEntries.push(attempt);
+        return setTimeout(() => groqReply(response, 200, kind === 'stt' ? { text: DEFAULT_STT_TEXT } : { choices: [{ message: { content: '{}' } }] }), 120_000).unref();
+      }
+      let payload: unknown;
+      if (kind === 'stt') {
+        const fields = parseMultipart(body, request.headers['content-type']);
+        if (!fields) return groqReply(response, 400, { error: 'expected multipart/form-data' });
+        attempt.model = fields.model?.toString() ?? null;
+        if (!attempt.model) return groqReply(response, 400, { error: 'missing multipart field: model' });
+        payload = { text: sttQueue.length > 0 ? sttQueue.shift() : DEFAULT_STT_TEXT };
+      } else {
+        let llmRequest: { model?: string; response_format?: { type?: string } };
+        try {
+          llmRequest = JSON.parse(body.toString('utf8'));
+        } catch {
+          return groqReply(response, 400, { error: 'invalid JSON' });
+        }
+        attempt.model = llmRequest.model ?? null;
+        if (!attempt.model) return groqReply(response, 400, { error: 'missing field: model' });
+        if (llmRequest.response_format?.type !== 'json_object') return groqReply(response, 400, { error: 'response_format.type must be json_object' });
+        const extraction = llmQueue.length > 0 ? llmQueue.shift()! : mode === 'hallucinated' ? HALLUCINATED_LLM : DEFAULT_LLM;
+        payload = { choices: [{ message: { role: 'assistant', content: JSON.stringify(extraction) } }] };
+      }
+      groqEntries.push(attempt);
+      if (mode === 'badjson') {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        return response.end('{"text": truncated');
+      }
+      return groqReply(response, 200, payload);
+    });
+    return;
+  }
+  groqReply(response, 404, { error: 'not found' });
+});
+
+let groqBase = '';
+async function groqControl(path: string, body?: unknown): Promise<unknown> {
+  const response = await fetch(`${groqBase}${path}`, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  });
+  assert.equal(response.status, 200, `groq control ${path} failed`);
+  return response.json();
+}
+const groqReset = async () => groqControl('/reset', {});
+const groqLedger = async () => groqControl('/ledger') as Promise<GroqLedger>;
 async function startApp() {
   // Config is evaluated by buildApp only after the local provider URL is installed.
   app = await buildApp({ WAHA_BASE_URL: providerUrl });
@@ -197,23 +372,39 @@ const scenarios: Array<[string, () => Promise<void>]> = [
       assert.equal((await postRaw(raw, hmac)).status, 401);
     }
     assert.equal((await request('/webhooks/waha', { method: 'POST', headers: { 'content-type': 'application/json' }, body: raw })).status, 401);
-    for (const invalid of ['{', 'null', '[]', '{"bad":true}', JSON.stringify({ ...envelope('bad-schema', 'novo'), payload: { id: 1 } }),
+    // Phase 4 contract: an HMAC-authenticated but structurally invalid envelope is
+    // persisted as webhook_events state='INVALID' and answered with 200 — never a
+    // 400, which made WAHA retry-storm and lose real voice notes (body=null bug).
+    const structurallyInvalid = [
+      '{', 'null', '[]', '{"bad":true}', JSON.stringify({ ...envelope('bad-schema', 'novo'), payload: { id: 1 } }),
       JSON.stringify(envelope('bad-boolean', 'novo', { hasMedia: 'yes' as unknown as boolean })),
       JSON.stringify(envelope('missing-from-me', 'novo', { fromMe: undefined })),
-      JSON.stringify(envelope('invalid-from-me', 'novo', { fromMe: 'false' as unknown as boolean }))]) {
-      assert.equal((await postRaw(invalid)).status, 400, invalid);
+      JSON.stringify(envelope('invalid-from-me', 'novo', { fromMe: 'false' as unknown as boolean }))];
+    for (const invalid of structurallyInvalid) {
+      assert.equal((await postRaw(invalid)).status, 200, invalid);
     }
+    // Raw não-parseável ('{') é respondido com 200 mas não cabe em jsonb.
+    const persistableInvalid = structurallyInvalid.filter((candidate) => {
+      try { JSON.parse(candidate); return true; } catch { return false; }
+    });
+    assert.deepEqual(
+      await prisma.$queryRawUnsafe<Array<{ state: string; events: number }>>(
+        `SELECT state, count(*)::int AS events FROM webhook_events WHERE state='INVALID' GROUP BY state`),
+      [{ state: 'INVALID', events: persistableInvalid.length }]);
+    assert.equal((await counts()).messages, 0, 'Invalid envelopes must not create messages');
+    assert.equal(providerAttempts.length, 0);
+    assert.equal((await groqLedger()).entries.length + deliveries.length, 0);
     const ignored = [
       { ...envelope('wrong-session', 'novo'), session: 'OtherSession' },
       envelope('from-me', 'novo', { fromMe: true }),
       envelope('group', 'novo', { from: '123456@g.us' }),
-      envelope('unknown-lid', 'novo', { from: '00000000000000@lid' }),
+      envelope('unknown-lid', 'novo', { from: '99999999999999@lid' }),
       envelope('unknown-phone', 'novo', { from: '5511988888888@c.us' }),
       envelope('phone-lookalike', 'novo', { from: '5511999999999@lid' }),
     ];
     for (const payload of ignored) assert.equal((await postRaw(JSON.stringify(payload))).status, 200);
     await tick();
-    assert.deepEqual(await counts(), { messages: 0, events: 0, conversations: 0, customers: 0, orders: 0, outbox: 0, audits: 0 });
+    assert.deepEqual(await counts(), { messages: 0, events: persistableInvalid.length, conversations: 0, customers: 0, orders: 0, outbox: 0, audits: 0 });
     assert.equal(providerAttempts.length, 0);
 
     // Whitespace is deliberate: authentication must use original bytes, not reserialized JSON.
@@ -564,6 +755,267 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await tick();
     assert.equal(providerAttempts.length, 1);
   }],
+  ['audio happy path: STT, LLM extraction, cadastro, due_date and confirmation', async () => {
+    await groqControl('/scenario', { stt: 'Troca da bomba de agua do poo', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Carlos Pereira', service_description: 'Troca da bomba de agua', service_amount: 150.5, materials_amount: null, due_date: '2026-11-10' } });
+    const audioId = id('audio-happy');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const offered = await reply(audioId);
+    assert.match(offered, /cadastr/i);
+    const create = await pending('CUSTOMER_CREATE');
+    assert.equal(create.payload?.description, 'Troca da bomba de agua');
+    const audio = await audioColumns(audioId);
+    assert.equal(audio.transcription, 'Troca da bomba de agua do poo');
+    assert.equal(audio.media_mimetype, 'audio/ogg');
+    assert.equal(audio.media_path, `/api/files/${settings.WAHA_SESSION}/${audioId}.oga`);
+    assert.deepEqual(mediaDownloads.map((download) => download.path), [`/api/files/${settings.WAHA_SESSION}/${audioId}.oga`]);
+    const created = await inbound('sim');
+    assert.match(created.text, /R\$ 150,50/);
+    assert.match(created.text, /Vence: 10\/11\/2026/);
+    assert.match(created.text, /Carlos Pereira/);
+    const [order] = await orders();
+    assert.equal(order.description, 'Troca da bomba de agua');
+    assert.equal(order.amount_cents, 15050);
+    assert.equal(order.due_date instanceof Date ? order.due_date.toISOString().slice(0, 10) : order.due_date, '2026-11-10');
+    assert.equal(order.status, 'AGUARDANDO_CONFIRMACAO');
+    assert.deepEqual(await audits(created.id).then((rows) => rows.map((row) => [row.entity_type, row.action])), [['customer', 'CREATE'], ['service_order', 'CREATE']]);
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    await pending(null);
+    const ledger = await groqLedger();
+    assert.deepEqual(ledger.entries.filter((entry) => entry.kind === 'stt').map((entry) => entry.model), [settings.GROQ_STT_MODEL]);
+    assert.deepEqual(ledger.entries.filter((entry) => entry.kind === 'llm').map((entry) => entry.model), [settings.GROQ_LLM_MODEL]);
+    assert.equal(ledger.entries.length, 2);
+  }],
+  ['ambiguous audio customer lands in CUSTOMER_CHOOSE preserving extraction', async () => {
+    const anaLima = await seedCustomer('Ana Lima');
+    const anaLuz = await seedCustomer('Ana Luz');
+    await groqControl('/scenario', { stt: 'Troca de resistencia do chuveiro', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Ana', service_description: 'Troca de resistencia', service_amount: null, materials_amount: null, due_date: '2026-11-12' } });
+    const audioId = id('audio-ambiguous');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const choose = await reply(audioId);
+    assert.match(choose, /Ana Lima/);
+    assert.match(choose, /Ana Luz/);
+    const state = await pending('CUSTOMER_CHOOSE');
+    assert.equal(state.payload?.description, 'Troca de resistencia');
+    const candidates = state.payload?.candidates as Array<{ id: string; name: string }>;
+    assert.deepEqual(new Set(candidates.map((customer) => customer.id)), new Set([anaLima, anaLuz]));
+    const selected = candidates.findIndex((candidate) => candidate.id === anaLuz) + 1;
+    assert.match((await inbound(String(selected))).text, /valor/i);
+    assert.equal((await orders()).length, 1);
+    assert.equal((await orders())[0]!.customer_id, anaLuz);
+    await inbound('80');
+    await pending('CONFIRM');
+    const summary = (await orders())[0]!;
+    assert.equal(summary.status, 'AGUARDANDO_CONFIRMACAO');
+    assert.equal(summary.amount_cents, 8000);
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    assert.match(confirmed.text, /Vence: 12\/11\/2026/);
+    const confirmedOrder = (await orders())[0]!;
+    assert.equal(confirmedOrder.due_date instanceof Date ? confirmedOrder.due_date.toISOString().slice(0, 10) : confirmedOrder.due_date, '2026-11-12');
+    assert.equal(confirmedOrder.status, 'CONFIRMADA');
+    await pending(null);
+  }],
+  ['audio without value asks VALUE; audio with value goes straight to confirmation', async () => {
+    await seedCustomer('Cliente Audio Valor');
+    await groqControl('/scenario', { stt: 'Limpeza da piscina', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Valor', service_description: 'Limpeza da piscina', service_amount: null, materials_amount: null, due_date: null } });
+    const withoutValue = id('audio-no-value');
+    await ingest(withoutValue, null, audioMedia(withoutValue));
+    await tick();
+    const asked = await reply(withoutValue);
+    assert.match(asked, /valor/i);
+    await pending('VALUE');
+    assert.equal((await orders())[0]!.description, 'Limpeza da piscina');
+    assert.equal((await orders())[0]!.amount_cents, null);
+    const first = await inbound('45,90');
+    assert.match(first.text, /R\$ 45,90/);
+    await inbound('sim');
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    await pending(null);
+    // Second voice note carries an amount: no VALUE step, direct confirmation summary.
+    // This one also exercises the media fallback (no payload.media.url at all).
+    await groqControl('/scenario', { stt: 'Troca de compressor', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Valor', service_description: 'Troca de compressor', service_amount: 300, materials_amount: null, due_date: null } });
+    const withValue = id('audio-with-value');
+    await ingest(withValue, null, audioMedia(withValue, { omitUrl: true }));
+    await tick();
+    const summary = await reply(withValue);
+    assert.match(summary, /R\$ 300,00/);
+    assert.match(summary, /AGUARDANDO_CONFIRMACAO|confirm/i);
+    await pending('CONFIRM');
+    assert.equal((await orders()).length, 2);
+    assert.equal((await orders())[1]!.amount_cents, 30000);
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    await pending(null);
+  }],
+  ['invalid or hallucinated LLM output falls back to the deterministic guided flow', async () => {
+    const transcription = 'Instalacao de ar condicionado na sala';
+    await groqControl('/scenario', { stt: transcription });
+    await groqControl('/scenario', { mode: 'badjson', endpoint: 'llm' });
+    const badJson = id('audio-badjson');
+    await ingest(badJson, null, audioMedia(badJson));
+    await tick();
+    const fallback = await reply(badJson);
+    assert.match(fallback, /Ouvi: "Instalacao de ar condicionado na sala"/);
+    assert.match(fallback, /nome.*cliente/i);
+    const state = await pending('CUSTOMER_NAME');
+    assert.equal(state.payload?.description, transcription);
+    assert.equal((await orders()).length, 0);
+    assert.equal((await counts()).customers, 0);
+    // Hallucinated extraction: valid JSON envelope, schema-invalid due_date ('amanha')
+    // must be rejected by zod, never invented as an OS field. STT is queued again:
+    // the fake provider serves the default text when its queue runs dry.
+    await groqControl('/scenario', { stt: transcription, mode: 'hallucinated', endpoint: 'llm' });
+    const hallucinated = id('audio-hallucinated');
+    await ingest(hallucinated, null, audioMedia(hallucinated));
+    await tick();
+    const fallbackTwo = await reply(hallucinated);
+    assert.match(fallbackTwo, /Ouvi: "Instalacao de ar condicionado na sala"/);
+    assert.match(fallbackTwo, /nome.*cliente/i);
+    assert.equal((await pending('CUSTOMER_NAME')).payload?.description, transcription);
+    assert.equal((await orders()).length, 0);
+    // The transcription becomes the description of the normal guided flow.
+    await seedCustomer('Cliente Fallback');
+    const named = await inbound('Cliente Fallback');
+    assert.match(named.text, /valor/i);
+    const [order] = await orders();
+    assert.equal(order.description, transcription);
+    assert.equal(order.status, 'AGUARDANDO_DADOS');
+  }],
+  ['LLM intent OUTRO answers deterministically and creates nothing', async () => {
+    await groqControl('/scenario', { stt: ' Qual o horario de funcionamento?', llm: { intent: 'OUTRO', customer_name: null, service_description: null, service_amount: null, materials_amount: null, due_date: null } });
+    const audioId = id('audio-outro');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const answered = await reply(audioId);
+    assert.match(answered, /OS|texto|comando|ajuda/i);
+    const row = await eventRow(audioId);
+    assert.equal(row.state, 'PROCESSED');
+    const skipped = await prisma.$queryRawUnsafe<Array<{ skipped_reason: string }>>('SELECT skipped_reason FROM messages WHERE message_id=$1', audioId);
+    assert.deepEqual(skipped, [{ skipped_reason: 'AUDIO_INTENT_IGNORED' }]);
+    assert.deepEqual(await counts(), { messages: 1, events: 1, conversations: 0, customers: 0, orders: 0, outbox: 1, audits: 0 });
+  }],
+  ['STT 5xx exhausts bounded inbox retries into a visible FAILED', async () => {
+    await groqControl('/scenario', { mode: '500', endpoint: 'stt' });
+    const audioId = id('audio-stt-500');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const first = await eventRow(audioId);
+    assert.equal(first.state, 'PENDING');
+    assert.ok(first.attempts >= 1);
+    for (let attempt = 0; attempt < 7; attempt += 1) await tick();
+    const exhausted = await eventRow(audioId);
+    assert.equal(exhausted.state, 'FAILED');
+    assert.equal(exhausted.attempts, 5);
+    assert.equal((await groqLedger()).entries.filter((entry) => entry.kind === 'stt').length, 5, 'The provider must receive exactly the bounded attempts');
+    assert.equal((await outbounds(audioId)).length, 0);
+    assert.equal((await orders()).length, 0);
+    assert.equal((await states()).length, 0);
+  }],
+  ['missing GROQ_API_KEY answers deterministic not-configured without any provider call', async () => {
+    await app!.close();
+    app = undefined;
+    delete process.env.GROQ_API_KEY;
+    await startApp();
+    const audioId = id('audio-unconfigured');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const answered = await reply(audioId);
+    assert.match(answered, /não está configurad|nao esta configurad|não configurad/i);
+    const row = await eventRow(audioId);
+    assert.equal(row.state, 'PROCESSED');
+    const skipped = await prisma.$queryRawUnsafe<Array<{ skipped_reason: string }>>('SELECT skipped_reason FROM messages WHERE message_id=$1', audioId);
+    assert.deepEqual(skipped, [{ skipped_reason: 'AUDIO_NOT_CONFIGURED' }]);
+    assert.deepEqual((await groqLedger()).entries, []);
+    process.env.GROQ_API_KEY = settings.GROQ_API_KEY;
+    await app!.close();
+    app = undefined;
+    await startApp();
+  }],
+  ['body null without media is EMPTY_TEXT, not a 400 loss', async () => {
+    const audioId = id('audio-null-body');
+    const response = await postRaw(JSON.stringify(envelope(audioId, null)));
+    assert.equal(response.status, 200, 'Regression: the real voice-note bug answered 400 and WAHA dropped the message');
+    await tick();
+    assert.match(await reply(audioId), /texto/i);
+    const row = await eventRow(audioId);
+    assert.equal(row.state, 'PROCESSED');
+    const skipped = await prisma.$queryRawUnsafe<Array<{ skipped_reason: string }>>('SELECT skipped_reason FROM messages WHERE message_id=$1', audioId);
+    assert.deepEqual(skipped, [{ skipped_reason: 'EMPTY_TEXT' }]);
+    assert.deepEqual((await groqLedger()).entries, []);
+    assert.equal((await states()).length, 0);
+  }],
+  ['authenticated structurally invalid envelope persists INVALID with 200 and no side effects', async () => {
+    const broken = JSON.stringify({ ...envelope('audio-broken', null), payload: { timestamp: 1793763818, from: settings.OPERATOR_LID } });
+    assert.equal((await postRaw(broken)).status, 200);
+    assert.deepEqual(
+      await prisma.$queryRawUnsafe<Array<{ state: string; events: number }>>(
+        `SELECT state, count(*)::int AS events FROM webhook_events WHERE state='INVALID' GROUP BY state`),
+      [{ state: 'INVALID', events: 1 }]);
+    assert.deepEqual(await counts(), { messages: 0, events: 1, conversations: 0, customers: 0, orders: 0, outbox: 0, audits: 0 });
+    assert.deepEqual((await groqLedger()).entries, []);
+    assert.equal(mediaDownloads.length, 0);
+    await tick();
+    assert.equal(providerAttempts.length, 0);
+    assert.deepEqual(await counts(), { messages: 0, events: 1, conversations: 0, customers: 0, orders: 0, outbox: 0, audits: 0 });
+  }],
+  ['non-audio media is rejected without any download', async () => {
+    const imageId = id('audio-image');
+    await ingest(imageId, 'veja a foto', audioMedia(imageId, { mimetype: 'image/jpeg', url: `http://waha-test:8090/api/files/${settings.WAHA_SESSION}/${imageId}.jpg` }));
+    await tick();
+    assert.match(await reply(imageId), /texto/i);
+    const skipped = await prisma.$queryRawUnsafe<Array<{ skipped_reason: string }>>('SELECT skipped_reason FROM messages WHERE message_id=$1', imageId);
+    assert.deepEqual(skipped, [{ skipped_reason: 'MEDIA_UNSUPPORTED' }]);
+    assert.equal(mediaDownloads.length, 0, 'Non-audio media must not be downloaded');
+    assert.deepEqual((await groqLedger()).entries, []);
+    assert.equal((await states()).length, 0);
+    assert.equal((await orders()).length, 0);
+  }],
+  ['media above the byte cap rejects AUDIO_TOO_LARGE before any STT call', async () => {
+    await app!.close();
+    app = undefined;
+    process.env.WAHA_MEDIA_MAX_BYTES = '65536';
+    await startApp();
+    const oversizeId = 'oversize-audio-note';
+    await ingest(oversizeId, null, audioMedia(oversizeId));
+    await tick();
+    const answered = await reply(oversizeId);
+    assert.match(answered, /grand|tamanho|limite/i);
+    const skipped = await prisma.$queryRawUnsafe<Array<{ skipped_reason: string }>>('SELECT skipped_reason FROM messages WHERE message_id=$1', oversizeId);
+    assert.deepEqual(skipped, [{ skipped_reason: 'AUDIO_TOO_LARGE' }]);
+    assert.equal(mediaDownloads.length, 1);
+    assert.ok(mediaDownloads[0]!.bytes > 65536);
+    assert.deepEqual((await groqLedger()).entries, [], 'No STT call may happen after the size cap rejects the media');
+    process.env.WAHA_MEDIA_MAX_BYTES = settings.WAHA_MEDIA_MAX_BYTES;
+    await app!.close();
+    app = undefined;
+    await startApp();
+  }],
+  ['redelivered audio envelope deduplicates transcription and orders', async () => {
+    await seedCustomer('Cliente Audio Duplicado');
+    await groqControl('/scenario', { stt: 'Reparo do portao eletronico', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Duplicado', service_description: 'Reparo do portao eletronico', service_amount: 120, materials_amount: null, due_date: null } });
+    const audioId = id('audio-duplicate');
+    const first = JSON.stringify(envelope(audioId, null, audioMedia(audioId)));
+    const redelivery = JSON.stringify({ ...envelope(audioId, null, audioMedia(audioId)), id: `${audioId}-redelivery` });
+    assert.deepEqual((await Promise.all([postRaw(first), postRaw(redelivery)])).map((response) => response.status), [200, 200]);
+    await Promise.all([tick(), tick()]);
+    await tick();
+    assert.match(await reply(audioId), /R\$ 120,00/);
+    const transcriptions = await prisma.$queryRawUnsafe<Array<{ transcription: string | null }>>('SELECT transcription FROM messages WHERE message_id=$1', audioId);
+    assert.equal(transcriptions.length, 1);
+    assert.equal(transcriptions[0]!.transcription, 'Reparo do portao eletronico');
+    assert.equal((await orders()).length, 1);
+    const ledger = await groqLedger();
+    assert.equal(ledger.entries.filter((entry) => entry.kind === 'stt').length, 1, 'Dedup happens before any provider call');
+    assert.equal(ledger.entries.filter((entry) => entry.kind === 'llm').length, 1);
+    assert.equal(mediaDownloads.length, 1);
+    await inbound('sim');
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    await pending(null);
+  }],
   ...(['reject400', 'reject503'] as const).map((mode): [string, () => Promise<void>] => [
     `${mode} has bounded retries and a persistent FAILED ledger`, async () => {
       deliveryMode = mode;
@@ -628,16 +1080,33 @@ const scenarios: Array<[string, () => Promise<void>]> = [
 ];
 
 let passed = 0;
+const listen = (server: http.Server) => {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  server.once('error', reject);
+  server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+  return promise;
+};
 try {
-  await new Promise<void>((resolve, reject) => {
-    provider.once('error', reject);
-    provider.listen(0, '127.0.0.1', () => { provider.off('error', reject); resolve(); });
-  });
+  await listen(provider);
   providerUrl = `http://127.0.0.1:${(provider.address() as AddressInfo).port}`;
   process.env.WAHA_BASE_URL = providerUrl;
-  await startApp();
+  // In the compose verify overlay GROQ_BASE_URL points at the groq-test service
+  // (scripts/test-groq-server.mjs); without it, run the in-process mirror.
+  if (!process.env.GROQ_BASE_URL) {
+    await listen(groqFake);
+    process.env.GROQ_BASE_URL = `http://127.0.0.1:${(groqFake.address() as AddressInfo).port}`;
+  }
+  groqBase = process.env.GROQ_BASE_URL;
   for (const [name, scenario] of scenarios) {
     await reset();
+    await groqReset();
+    // Every scenario starts from the canonical settings; scenarios that need a
+    // different configuration mutate and restart, then must restore it.
+    process.env.GROQ_API_KEY = settings.GROQ_API_KEY;
+    process.env.WAHA_MEDIA_MAX_BYTES = settings.WAHA_MEDIA_MAX_BYTES;
+    if (app) await app.close();
+    app = undefined;
+    await startApp();
     try {
       await scenario();
       assert.deepEqual(providerErrors, [], 'The local provider must receive valid authenticated requests');
@@ -647,7 +1116,7 @@ try {
       throw new Error(`Integration scenario failed: ${name}`, { cause });
     }
   }
-  console.log(`integration PASS: ${passed} PostgreSQL and real HTTP behavioral scenarios; isolated NOWEB provider only`);
+  console.log(`integration PASS: ${passed} PostgreSQL and real HTTP behavioral scenarios; isolated NOWEB/Groq providers only`);
 } finally {
   // Nested finally blocks ensure a failed assertion or app shutdown cannot leak other services.
   try {
@@ -657,7 +1126,11 @@ try {
       provider.closeAllConnections();
       if (provider.listening) await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
     } finally {
-      await prisma.$disconnect();
+      try {
+        if (groqFake.listening) await new Promise<void>((resolve, reject) => groqFake.close((error) => error ? reject(error) : resolve()));
+      } finally {
+        await prisma.$disconnect();
+      }
     }
   }
 }

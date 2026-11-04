@@ -14,6 +14,46 @@ export class SendFailure extends Error {
   }
 }
 
+// Baixa mídia do WAHA pelo caminho (path) persistido na ingestão — nunca pela
+// URL absoluta do payload, que aponta para o host público.
+export class MediaFailure extends Error {
+  constructor(message: string, readonly outcome: 'REJECTED' | 'TRANSIENT') {
+    super(message);
+    this.name = 'MediaFailure';
+  }
+}
+
+export async function downloadWahaMedia(
+  cfg: Config,
+  mediaPath: string,
+  maxBytes: number,
+): Promise<{ bytes: Buffer; contentType: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await fetch(`${cfg.WAHA_BASE_URL.replace(/\/$/, '')}${mediaPath}`, {
+      signal: controller.signal,
+      headers: { 'X-Api-Key': cfg.WAHA_API_KEY },
+    });
+    if (!response.ok) {
+      throw new MediaFailure(`WAHA_MEDIA_HTTP_${response.status}`, response.status < 500 ? 'REJECTED' : 'TRANSIENT');
+    }
+    const declared = response.headers.get('content-length');
+    if (declared !== null && Number(declared) > maxBytes) {
+      throw new MediaFailure('WAHA_MEDIA_TOO_LARGE', 'REJECTED');
+    }
+    const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length > maxBytes) throw new MediaFailure('WAHA_MEDIA_TOO_LARGE', 'REJECTED');
+    return { bytes, contentType };
+  } catch (error) {
+    if (error instanceof MediaFailure) throw error;
+    throw new MediaFailure(error instanceof Error ? error.name : 'WAHA_MEDIA_NETWORK_ERROR', 'TRANSIENT');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function sendWaha(cfg: Config, chatId: string, text: string): Promise<{ id: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);

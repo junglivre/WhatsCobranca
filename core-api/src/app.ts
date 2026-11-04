@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { config, type Config } from './config.js';
 import { processMessage } from './domain.js';
@@ -9,38 +10,70 @@ type IdentityRow = { operator_id: string };
 type EventRow = { id: string; message_db_id: string };
 type OutboundRow = { id: string; reply_to: string; body: string };
 
+const envelopeSchema = z.object({
+  id: z.string().min(1),
+  session: z.string(),
+  event: z.literal('message'),
+  payload: z.object({
+    id: z.string().min(1),
+    from: z.string().min(1),
+    fromMe: z.boolean(),
+    // body pode ser null em mensagens de mídia sem legenda (verificado em produção).
+    body: z.string().nullable(),
+    hasMedia: z.boolean(),
+    media: z.object({ url: z.string().min(1), mimetype: z.string() }).partial().nullish(),
+  }),
+});
+
 type WahaEnvelope = {
   id: string;
   session: string;
-  event: 'message';
-  payload: { id: string; from: string; fromMe: boolean; body: string; hasMedia: boolean };
+  payload: {
+    id: string;
+    from: string;
+    fromMe: boolean;
+    body: string; // normalizado: null (mídia sem legenda) vira ''
+    hasMedia: boolean;
+    mediaMimetype: string | null;
+    mediaPath: string | null; // path de media.url, para download interno
+  };
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function parseEnvelope(raw: Buffer): WahaEnvelope | null {
-  let value: unknown;
+function parseEnvelope(raw: Buffer): { parseOk: boolean; envelope: WahaEnvelope | null } {
+  let json: unknown;
+  let parseOk = true;
   try {
-    value = JSON.parse(raw.toString('utf8'));
+    json = JSON.parse(raw.toString('utf8'));
   } catch {
-    return null;
+    parseOk = false;
   }
-  if (!isRecord(value) || value.event !== 'message' || typeof value.id !== 'string' ||
-      typeof value.session !== 'string' || !isRecord(value.payload)) return null;
-
-  const payload = value.payload;
-  if (typeof payload.id !== 'string' || payload.id.length === 0 ||
-      typeof payload.from !== 'string' || payload.from.length === 0 ||
-      typeof payload.body !== 'string' || typeof payload.hasMedia !== 'boolean' ||
-      typeof payload.fromMe !== 'boolean') return null;
-
+  if (!parseOk) return { parseOk, envelope: null };
+  const parsed = envelopeSchema.safeParse(json);
+  if (!parsed.success) return { parseOk, envelope: null };
+  const { id, session, payload } = parsed.data;
+  let mediaPath: string | null = null;
+  if (payload.media?.url) {
+    try {
+      mediaPath = new URL(payload.media.url).pathname;
+    } catch {
+      mediaPath = null;
+    }
+  }
   return {
-    id: value.id,
-    session: value.session,
-    event: 'message',
-    payload: { id: payload.id, from: payload.from, fromMe: payload.fromMe, body: payload.body, hasMedia: payload.hasMedia },
+    parseOk,
+    envelope: {
+      id,
+      session,
+      payload: {
+        id: payload.id,
+        from: payload.from,
+        fromMe: payload.fromMe,
+        body: payload.body ?? '',
+        hasMedia: payload.hasMedia,
+        mediaMimetype: payload.media?.mimetype ?? null,
+        mediaPath,
+      },
+    },
   };
 }
 
@@ -62,7 +95,7 @@ async function ensureOperator(prisma: PrismaClient, cfg: Config): Promise<void> 
   }
 }
 
-async function processPendingEvent(prisma: PrismaClient): Promise<boolean> {
+async function processPendingEvent(prisma: PrismaClient, cfg: Config): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
     // The POC has one operator. A transaction-scoped mutex serializes inbox
     // state changes without keeping a transaction open during provider I/O.
@@ -92,7 +125,7 @@ async function processPendingEvent(prisma: PrismaClient): Promise<boolean> {
 
     await tx.$executeRawUnsafe('SAVEPOINT message_processing');
     try {
-      await processMessage(tx, event);
+      await processMessage(tx, event, cfg);
       await tx.$executeRawUnsafe(
         "UPDATE webhook_events SET state='PROCESSED', processed_at=now(), last_error=NULL WHERE id=$1::uuid",
         event.id,
@@ -195,8 +228,21 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     if (!validHmac(raw, Array.isArray(header) ? header[0] : header, cfg.WAHA_WEBHOOK_SECRET)) {
       return reply.code(401).send({ error: 'invalid_hmac' });
     }
-    const event = parseEnvelope(raw);
-    if (!event) return reply.code(400).send({ error: 'invalid_envelope' });
+    const { parseOk, envelope: event } = parseEnvelope(raw);
+    if (!event) {
+      // Envelope autenticado (HMAC válido) mas estruturalmente inválido:
+      // persiste para perícia e confirma com 200. Responder 400 faria o WAHA
+      // esgotar o retry exponencial e perder a mensagem (bug real da Fase 3).
+      // Raw não-JSON não tem valor forense e não cabe em jsonb: só 200.
+      if (parseOk) {
+        await prisma.$executeRawUnsafe(
+          `INSERT INTO webhook_events(session, message_id, message_db_id, state, raw, processed_at)
+           VALUES(NULL, NULL, NULL, 'INVALID', $1::jsonb, now())`,
+          raw.toString('utf8'),
+        );
+      }
+      return { accepted: true, ignored: true, invalid: true };
+    }
     const message = event.payload;
     if (event.session !== cfg.WAHA_SESSION || message.fromMe || message.from.endsWith('@g.us')) {
       return { accepted: true, ignored: true };
@@ -210,10 +256,11 @@ export async function buildApp(overrides: Partial<Config> = {}) {
 
     await prisma.$transaction(async (tx) => {
       const inserted = await tx.$queryRawUnsafe<{ id: string }[]>(
-        `INSERT INTO messages(operator_id, session, message_id, reply_to, body, has_media)
-         VALUES($1::uuid, $2, $3, $4, $5, $6)
+        `INSERT INTO messages(operator_id, session, message_id, reply_to, body, has_media, media_mimetype, media_path)
+         VALUES($1::uuid, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT(session, message_id) DO NOTHING RETURNING id`,
-        identity.operator_id, event.session, message.id, message.from, message.body, message.hasMedia,
+        identity.operator_id, event.session, message.id, message.from,
+        message.body, message.hasMedia, message.mediaMimetype, message.mediaPath,
       );
       const stored = inserted[0];
       if (!stored) return;
@@ -234,7 +281,7 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     let processed = 0;
     let sent = await deliver(prisma, cfg);
     for (let index = 0; index < 20; index += 1) {
-      if (!(await processPendingEvent(prisma))) break;
+      if (!(await processPendingEvent(prisma, cfg))) break;
       processed += 1;
       sent += await deliver(prisma, cfg);
     }

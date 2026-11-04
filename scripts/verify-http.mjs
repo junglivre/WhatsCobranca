@@ -57,14 +57,17 @@ async function delivered(id) {
   }, `n8n delivery of ${id}`);
 }
 
-assert.deepEqual(await request('http://127.0.0.1:18080/health'), { ok: true });
-await request('http://127.0.0.1:18080/automation/tick', { method: 'POST' }, 401);
+assert.deepEqual(await request('http://127.0.0.1:18082/health'), { ok: true });
+await request('http://127.0.0.1:18082/automation/tick', { method: 'POST' }, 401);
 for (const path of ['/health', '/automation/tick', '/webhook/poc1-tick', '/webhooks/waha/extra']) {
   await request(`http://127.0.0.1:18081${path}`, { method: 'POST' }, 404);
 }
 await request('http://127.0.0.1:18081/webhooks/waha', {}, 404);
 await request('http://127.0.0.1:18081/webhooks/waha', { method: 'POST', headers: { 'content-type': 'application/json', 'x-webhook-hmac': '00' }, body: '{}' }, 401);
-await request('http://127.0.0.1:18081/webhooks/waha', { method: 'POST', headers: signed('{}'), body: '{}' }, 400);
+// Fase 4: envelope autenticado malformado persiste INVALID e confirma 200
+// (400 fazia o WAHA esgotar retry e perder a mensagem real).
+await request('http://127.0.0.1:18081/webhooks/waha', { method: 'POST', headers: signed('{}'), body: '{}' }, 200);
+assert.equal(sql(`SELECT count(*) FROM webhook_events WHERE state='INVALID'`), '1', 'Authenticated malformed envelope must be parked as INVALID');
 assert.equal(sql(`SELECT active::text FROM n8n.workflow_entity WHERE id='WhatsCobrancaPoc1Tick'`), 'true', 'Imported canonical workflow must be active');
 assert.equal(sql("SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='workflow_entity'"), '0', 'n8n must not use the domain schema');
 
@@ -97,7 +100,7 @@ await delivered(proofId);
 compose(['stop', 'n8n']);
 const restartId = await inbound();
 compose(['restart', 'core-api']);
-await until(async () => (await request('http://127.0.0.1:18080/health')).ok, 'Core restart health');
+await until(async () => (await request('http://127.0.0.1:18082/health')).ok, 'Core restart health');
 assert.equal(sql(`SELECT state FROM webhook_events WHERE message_id='${restartId}'`), 'PENDING');
 compose(['start', 'n8n']);
 await delivered(restartId);

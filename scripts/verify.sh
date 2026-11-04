@@ -11,11 +11,14 @@ export AUTOMATION_TOKEN=verify_automation_token_0123456789abcdef
 export WAHA_WEBHOOK_SECRET=verify_webhook_secret_0123456789abcdef
 export WAHA_API_KEY=verify-isolated-key WAHA_BASE_URL=http://waha-test:8090
 export WAHA_SESSION=default OPERATOR_LID=00000000000000@lid OPERATOR_PHONE=5511999999999@c.us
+export GROQ_API_KEY=verify-isolated-key GROQ_BASE_URL=http://groq-test:8091
+export GROQ_STT_MODEL=whisper-large-v3 GROQ_LLM_MODEL=llama-3.3-70b-versatile
+export WAHA_MEDIA_MAX_BYTES=65536
 export N8N_ENCRYPTION_KEY=verify_n8n_encryption_key_0123456789
 compose=(docker compose --env-file /dev/null -f docker-compose.yml -f docker-compose.verify.yml --project-name whatscobranca_verify)
 # Recreate only the isolated test network/containers, keeping its volumes.
 "${compose[@]}" down --remove-orphans
-"${compose[@]}" up -d --wait --wait-timeout 180 postgres waha-test
+"${compose[@]}" up -d --wait --wait-timeout 180 postgres waha-test groq-test
 "${compose[@]}" stop n8n core-api webhook-proxy n8n-init n8n-schema
 # Only these fixed verification databases may be reset. No operational volume removal.
 "${compose[@]}" exec -T postgres psql -U whatscobranca -d postgres -v ON_ERROR_STOP=1 \
