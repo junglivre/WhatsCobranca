@@ -1,0 +1,119 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url = env("DATABASE_URL")
+}
+model Operator {
+  id String @id @db.Uuid
+  label String @unique
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  identities WhatsappIdentity[]
+  conversations ConversationState[]
+  messages Message[]
+  outbound OutboundMessage[]
+  @@map("operators")
+}
+model WhatsappIdentity {
+  id String @id @db.Uuid
+  value String @unique
+  operatorId String @map("operator_id") @db.Uuid
+  operator Operator @relation(fields:[operatorId],references:[id])
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@map("whatsapp_identities")
+}
+model Customer {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name String
+  normalizedName String @map("normalized_name")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  orders ServiceOrder[]
+  @@index([normalizedName])
+  @@map("customers")
+}
+model ServiceOrder {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  number Int @unique
+  customerId String @map("customer_id") @db.Uuid
+  customer Customer @relation(fields:[customerId],references:[id])
+  description String
+  amountCents Int? @map("amount_cents")
+  status String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  confirmedAt DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  cancelledAt DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  @@map("service_orders")
+}
+model ConversationState {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operatorId String @unique @map("operator_id") @db.Uuid
+  operator Operator @relation(fields:[operatorId],references:[id])
+  pendingAction String? @map("pending_action")
+  payload Json?
+  serviceOrderId String? @map("service_order_id") @db.Uuid
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(6)
+  replyTo String? @map("reply_to")
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  @@map("conversation_states")
+}
+model Message {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operatorId String @map("operator_id") @db.Uuid
+  operator Operator @relation(fields:[operatorId],references:[id])
+  session String
+  messageId String @map("message_id")
+  replyTo String @map("reply_to")
+  body String?
+  hasMedia Boolean @map("has_media")
+  skippedReason String? @map("skipped_reason")
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  @@unique([session,messageId])
+  @@map("messages")
+}
+model WebhookEvent {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  session String
+  messageId String @map("message_id")
+  messageDbId String @map("message_db_id") @db.Uuid
+  state String @default("PENDING")
+  attempts Int @default(0)
+  lastError String? @map("last_error")
+  raw Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+  position BigInt @unique @default(autoincrement())
+  @@unique([session,messageId])
+  @@map("webhook_events")
+}
+model OutboundMessage {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operatorId String @map("operator_id") @db.Uuid
+  operator Operator @relation(fields:[operatorId],references:[id])
+  correlationMessageId String? @map("correlation_message_id") @db.Uuid
+  replyTo String @map("reply_to")
+  body String
+  dedupKey String @unique @map("dedup_key")
+  status String @default("PENDING")
+  attempts Int @default(0)
+  providerMessageId String? @map("provider_message_id")
+  lastError String? @map("last_error")
+  leaseUntil DateTime? @map("lease_until") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt DateTime? @map("sent_at") @db.Timestamptz(6)
+  position BigInt @unique @default(autoincrement())
+  @@map("outbound_messages")
+}
+model AuditLog {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorId String @map("actor_id") @db.Uuid
+  sourceMessageId String? @map("source_message_id") @db.Uuid
+  entityType String @map("entity_type")
+  entityId String @map("entity_id")
+  action String
+  previousStatus String? @map("previous_status")
+  newStatus String? @map("new_status")
+  reason String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@map("audit_logs")
+}

@@ -1,0 +1,34 @@
+# Docker Compose >= 2.24.4 is required for !override port replacement.
+services:
+  postgres:
+    ports: !override ["127.0.0.1:55433:5432"]
+  core-api:
+    environment:
+      WAHA_BASE_URL: http://waha-test:8090
+      WAHA_API_KEY: verify-isolated-key
+    ports: !override ["127.0.0.1:18080:8080"]
+    depends_on:
+      waha-test: {condition: service_healthy}
+  n8n:
+    environment:
+      WEBHOOK_URL: http://localhost:15678/
+    ports: !override ["127.0.0.1:15678:5678"]
+  webhook-proxy:
+    ports: !override ["127.0.0.1:18081:8081"]
+  waha-test:
+    image: node:22.18.0-bookworm-slim
+    restart: unless-stopped
+    working_dir: /test
+    volumes: [./scripts/test-waha-server.mjs:/test/server.mjs:ro]
+    command: ["node", "server.mjs"]
+    ports: !override ["127.0.0.1:18090:8090"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8090/health').then(x=>process.exit(x.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+networks:
+  default:
+    ipam:
+      config: !override
+        - subnet: ${VERIFY_SUBNET:-10.245.211.0/24}

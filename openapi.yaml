@@ -1,0 +1,119 @@
+openapi: 3.0.3
+info:
+  title: WhatsCobranca POC1 Core API
+  version: 0.1.0
+  description: Only POST /webhooks/waha may pass through the public webhook-only proxy.
+servers:
+  - url: http://127.0.0.1:8080
+paths:
+  /health:
+    get:
+      summary: Check API and PostgreSQL connectivity
+      responses:
+        '200':
+          description: PostgreSQL query succeeded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean, enum: [true]}
+        '500': {description: Database unavailable or unexpected internal error}
+  /webhooks/waha:
+    post:
+      summary: Persist an authenticated WAHA inbound message
+      description: >-
+        HMAC-SHA512 uses the exact raw request bytes and the private webhook secret.
+        Default body limit is 131072 bytes. Valid ignored messages (wrong session,
+        fromMe, groups, unauthorized identity) return 200 without changing business
+        state. Duplicate (session,payload.id) deliveries return 200 without repeated
+        effects. A successful response acknowledges database commit, not WhatsApp delivery.
+      parameters:
+        - in: header
+          name: X-Webhook-Hmac
+          required: true
+          schema: {type: string, pattern: '^[a-fA-F0-9]{128}$'}
+          description: Hexadecimal HMAC-SHA512 of unmodified body bytes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WahaEnvelope'}
+      responses:
+        '200':
+          description: Accepted, duplicate, or safely ignored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted]
+                properties:
+                  accepted: {type: boolean, enum: [true]}
+                  ignored: {type: boolean}
+        '400':
+          description: Authenticated JSON/envelope is invalid; no processing
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Missing or invalid HMAC
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {description: Body exceeds configured limit (default 128 KiB)}
+        '415': {description: Unsupported Content-Type; use application/json}
+        '500': {description: Persistence unavailable or unexpected internal error; sender may retry}
+  /automation/tick:
+    post:
+      summary: Process durable inbox and publish eligible outbox messages
+      description: >-
+        Private endpoint invoked by n8n. Requires exact Bearer token even on the
+        internal network. Processing and delivery counts describe this tick only;
+        they do not guarantee that every pending message could be processed.
+        FAILED or UNCERTAIN rows block later work for that operator until review.
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Tick completed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [processed, sent]
+                properties:
+                  processed: {type: integer, minimum: 0}
+                  sent: {type: integer, minimum: 0}
+        '401':
+          description: Missing or invalid automation Bearer token
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '500': {description: Database unavailable or unexpected internal error}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer}
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+    WahaEnvelope:
+      type: object
+      required: [id, session, event, payload]
+      properties:
+        id: {type: string, description: Envelope id; not the deduplication key}
+        timestamp: {type: number}
+        session: {type: string, example: default}
+        event: {type: string, enum: [message]}
+        engine: {type: string, example: NOWEB}
+        payload:
+          type: object
+          required: [id, from, fromMe, body, hasMedia]
+          properties:
+            id: {type: string, minLength: 1, description: Provider message id; deduplication uses session plus this id}
+            timestamp: {type: number}
+            from: {type: string, minLength: 1}
+            fromMe: {type: boolean}
+            body: {type: string}
+            hasMedia: {type: boolean}

@@ -1,0 +1,29 @@
+{
+  "id": "WhatsCobrancaPoc1Tick",
+  "name": "WhatsCobranca POC1 - persistent tick",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {"httpMethod": "POST", "path": "poc1-tick", "responseMode": "lastNode"},
+      "id": "webhook", "webhookId": "1f87731e-d40d-456d-9775-d26669702bb2",
+      "name": "Private local tick webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [260, 300]
+    },
+    {
+      "parameters": {"rule": {"interval": [{"field": "seconds", "secondsInterval": 5}]}},
+      "id": "schedule", "name": "Recovery schedule", "type": "n8n-nodes-base.scheduleTrigger", "typeVersion": 1.2, "position": [260, 120]
+    },
+    {
+      "parameters": {
+        "method": "POST", "url": "http://core-api:8080/automation/tick", "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Authorization", "value": "=Bearer {{$env.AUTOMATION_TOKEN}}"}]},
+        "options": {"timeout": 30000}
+      },
+      "id": "tick", "name": "Call authenticated Core tick", "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.2, "position": [520, 220]
+    }
+  ],
+  "connections": {
+    "Private local tick webhook": {"main": [[{"node": "Call authenticated Core tick", "type": "main", "index": 0}]]},
+    "Recovery schedule": {"main": [[{"node": "Call authenticated Core tick", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1", "timezone": "America/Sao_Paulo", "saveDataSuccessExecution": "none", "saveDataErrorExecution": "all"}
+}

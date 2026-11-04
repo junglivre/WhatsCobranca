@@ -1,0 +1,12 @@
+{
+  "name": "whatscobranca-poc1",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix core-api run build",
+    "test": "npm --prefix core-api test",
+    "verify": "bash scripts/verify.sh",
+    "bootstrap:env": "bash scripts/bootstrap-env.sh",
+    "backup": "bash scripts/backup.sh",
+    "restore": "bash scripts/restore.sh"
+  }
+}

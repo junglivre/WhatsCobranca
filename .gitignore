@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.test
+backups/
+*.log
+core-api/node_modules/
+core-api/dist/
+core-api/.prisma/
+.runtime/

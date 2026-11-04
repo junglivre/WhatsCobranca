@@ -1,0 +1,24 @@
+{
+  "name": "whatscobranca-core-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "migrate:deploy": "prisma migrate deploy",
+    "test": "tsx test/integration.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "6.8.2",
+    "fastify": "5.3.3",
+    "zod": "3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.18",
+    "prisma": "6.8.2",
+    "tsx": "4.19.4",
+    "typescript": "5.8.3"
+  }
+}
