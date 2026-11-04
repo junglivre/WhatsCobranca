@@ -127,6 +127,18 @@ Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`)
 
 **Limitação conhecida (POC):** OS em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO` que o operador nunca confirma (ou abandona ao iniciar outro atendimento por áudio) ficam abertas no banco — não há comando para cancelar OS por número nem retomar rascunho nesta fase. Elas aparecem nas consultas; cancelamento dirigido por número fica para o próximo ciclo.
 
+## Estoque (Fase 5)
+
+Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`) e ledger de movimentações (`stock_movements`: IN/OUT/ADJUST/RETURN). Quantidades em `numeric(12,3)` — aritmética sempre no SQL, nunca Float em JS.
+
+**Comandos:** `material novo` (guiado: nome → unidade → saldo inicial → mínimo), `entrada 10 cabo`, `ajustar cabo para 20` (mostra atual → novo, pede confirmação), `devolver 2 cabo OS 5`, `saldo cabo`, `estoque`.
+
+**Materiais na OS:** após o valor, o bot pergunta "Usou materiais? Liste 'quantidade nome' separado por vírgula ou responda não. (Ex.: 2 cabo, 3 disjuntor)". Na lista, **decimais usam ponto** (`2.5 cabo`) — a vírgula separa itens (`2,5 cabo` sozinho também funciona como decimal). Materiais resolvidos no catálogo são baixados transacionalmente na confirmação; material inexistente entra como **pendente de cadastro** (sem baixa, citado no recibo).
+
+**Regras:** sem saldo negativo (confirmação bloqueada com mensagem determinística — dê entrada e confirme de novo); baixa idempotente (re-confirmação nunca duplica movement); itens imutáveis após confirmar; `corrigir materiais` reabre a lista apagando os itens do rascunho. Nota de voz também preenche materiais quando o LLM extrai a lista (material ambíguo/inexistente fica pendente, nunca criado automaticamente).
+
+**Limitação:** custo médio do material não é calculado nesta fase (sem campo nem fluxo); cancelamento dirigido de OS por número segue pendente.
+
 ## Verificação isolada
 
 ```sh

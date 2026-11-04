@@ -34,6 +34,15 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - Segredos só em `.env` (gitignorado, permissão 600). Nunca hardcode identidade real de operador, domínio ou chave de API em código, docs ou testes — use os placeholders já presentes (`00000000000000@lid`, `5511999999999@c.us`, `your-waha-instance.example.com`, sessão `default`).
 - Scripts (`scripts/*.sh`) usam `set -euo pipefail`, nunca removem volumes/bancos operacionais, e todo script de restauração/backup recusa sobrescrever destino existente.
 
+## Invariantes de estoque (Fase 5)
+
+- Quantidades são `numeric(12,3)` no PostgreSQL e **string** no Node (node-postgres). Toda aritmética/comparação de saldo acontece em SQL (`quantity - $x >= 0`), nunca em Float JS. Leitura de numeric sem `::text` volta como objeto Decimal do Prisma — sempre cast `::text` na query.
+- Baixa de estoque é transacional com a confirmação da OS, trava itens em ordem determinística (`ORDER BY id FOR UPDATE`), valida saldo ANTES de mover o status e responde deterministicamente quando insuficiente (estado permanece CONFIRM). Re-confirmação é idempotente: nunca duplica movement.
+- `stock_movements` é o ledger completo (IN/OUT/ADJUST/RETURN com operador, mensagem de origem e OS quando aplicável). ADJUST de delta zero é no-op determinístico — movement de quantidade 0 viola CHECK.
+- Item de OS sem `inventory_item_id` é pendente de classificação: não baixa estoque, citado no recibo. Materiais extraídos por áudio seguem a mesma regra — nunca criam item de catálogo automaticamente.
+- Itens de OS são imutáveis após `CONFIRMADA`/`CANCELADA`; `corrigir materiais` apaga e reabre a lista APENAS em rascunho.
+- Órdem de exibição dos itens usa a coluna `position` (ordem de digitação), nunca `created_at` (idêntico na mesma transação).
+
 ## Antes de abrir PR
 
 - Rode `npm run verify` (requer Docker Compose ≥ 2.24.4) e cole a saída completa.

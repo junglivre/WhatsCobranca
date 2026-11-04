@@ -12,7 +12,8 @@ export function buildExtractionPrompt(todayIsoDate: string): string {
     '  "service_description": string | null,',
     '  "service_amount": number | null,',
     '  "materials_amount": number | null,',
-    '  "due_date": "YYYY-MM-DD" | null',
+    '  "due_date": "YYYY-MM-DD" | null,',
+    '  "materials": [{"name": string, "quantity": number}] | null',
     '}',
     'Regras obrigatórias:',
     '- intent é REGISTRAR_SERVICO apenas quando o áudio relata um atendimento/serviço prestado a um cliente. Saudações, perguntas ou qualquer outro assunto são OUTRO.',
@@ -20,6 +21,7 @@ export function buildExtractionPrompt(todayIsoDate: string): string {
     '- customer_name é o nome ou apelido do cliente mencionado (sem títulos como "cliente", "senhor").',
     '- service_description é a descrição curta do serviço executado.',
     '- service_amount e materials_amount são números em reais (ex.: 350.50), apenas quando ditos com clareza ("trezentos e cinquenta reais" = 350). Não inclua materiais no service_amount.',
+    '- materials: apenas materiais com quantidade clara e específica ("15 metros de cabo" = {"name": "cabo", "quantity": 15}); sem quantidade clara, omita o material; nenhum material dito = null.',
     '- due_date só quando houver data de vencimento/pagamento dita com clareza; "sexta" resolve para a sexta-feira da semana corrente a partir de hoje.',
     '- Não confirme pagamento, não emita recomendações, não adicione campos extras.',
   ].join('\n');

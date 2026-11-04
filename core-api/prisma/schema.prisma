@@ -109,15 +109,58 @@ model OutboundMessage {
   @@map("outbound_messages")
 }
 model AuditLog {
-  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  actorId String @map("actor_id") @db.Uuid
+  id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  actorId     String    @map("actor_id") @db.Uuid
   sourceMessageId String? @map("source_message_id") @db.Uuid
-  entityType String @map("entity_type")
-  entityId String @map("entity_id")
-  action String
+  entityType  String    @map("entity_type")
+  entityId    String    @map("entity_id")
+  action      String
   previousStatus String? @map("previous_status")
-  newStatus String? @map("new_status")
-  reason String?
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  newStatus   String?   @map("new_status")
+  reason      String?
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   @@map("audit_logs")
+}
+
+model InventoryItem {
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String
+  normalizedName String @map("normalized_name")
+  unit          String
+  quantity      Decimal  @default(0) @db.Decimal(12, 3)
+  minQuantity   Decimal? @map("min_quantity") @db.Decimal(12, 3)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  orderItems    ServiceOrderItem[]
+  movements     StockMovement[]
+  @@index([normalizedName])
+  @@map("inventory_items")
+}
+
+model ServiceOrderItem {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  serviceOrderId String        @map("service_order_id") @db.Uuid
+  inventoryItemId String?      @map("inventory_item_id") @db.Uuid
+  inventoryItem  InventoryItem? @relation(fields: [inventoryItemId], references: [id])
+  rawName        String        @map("raw_name")
+  quantity       Decimal       @db.Decimal(12, 3)
+  position       BigInt        @unique @default(autoincrement())
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@index([serviceOrderId])
+  @@map("service_order_items")
+}
+
+model StockMovement {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  inventoryItemId String        @map("inventory_item_id") @db.Uuid
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  movementType    String        @map("movement_type")
+  quantity        Decimal       @db.Decimal(12, 3)
+  reason          String?
+  serviceOrderId  String?       @map("service_order_id") @db.Uuid
+  operatorId      String        @map("operator_id") @db.Uuid
+  sourceMessageId String?       @map("source_message_id") @db.Uuid
+  createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@index([inventoryItemId, createdAt])
+  @@map("stock_movements")
 }

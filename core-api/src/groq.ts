@@ -79,6 +79,7 @@ export async function transcribeAudio(cfg: Config, audio: Buffer, filename: stri
   }
 }
 
+export type ExtractionMaterial = { name: string; quantity: number };
 export type Extraction = {
   intent: 'REGISTRAR_SERVICO' | 'OUTRO';
   customerName: string | null;
@@ -86,7 +87,26 @@ export type Extraction = {
   serviceAmount: number | null;
   materialsAmount: number | null;
   dueDate: string | null;
+  materials: ExtractionMaterial[];
 };
+
+function parseExtractionMaterials(value: unknown): ExtractionMaterial[] {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) throw new GroqFailure('GROQ_LLM_HALLUCINATED_FIELD', 'REJECTED');
+  const materials: ExtractionMaterial[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'object' || entry === null) throw new GroqFailure('GROQ_LLM_HALLUCINATED_FIELD', 'REJECTED');
+    const record = entry as Record<string, unknown>;
+    const name = typeof record.name === 'string' ? record.name.trim() : '';
+    const quantity = typeof record.quantity === 'number' ? record.quantity : Number.NaN;
+    // Material malformado invalida a extração inteira (mesma regra do due_date).
+    if (name.length === 0 || !Number.isFinite(quantity) || quantity <= 0 || quantity > 999999999.999) {
+      throw new GroqFailure('GROQ_LLM_HALLUCINATED_FIELD', 'REJECTED');
+    }
+    materials.push({ name, quantity });
+  }
+  return materials;
+}
 
 function parseExtraction(value: unknown): Extraction {
   if (typeof value !== 'object' || value === null) throw new GroqFailure('GROQ_LLM_MALFORMED', 'REJECTED');
@@ -117,6 +137,7 @@ function parseExtraction(value: unknown): Extraction {
     serviceAmount: amount('service_amount'),
     materialsAmount: amount('materials_amount'),
     dueDate,
+    materials: parseExtractionMaterials(record.materials),
   };
 }
 

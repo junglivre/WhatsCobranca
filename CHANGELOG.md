@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — Fase 5: Estoque/materiais
+
+- `inventory_items` + `service_order_items` (reintroduzida) + `stock_movements` (IN/OUT/ADJUST/RETURN) com quantidades `numeric(12,3)` — aritmética sempre no SQL, nunca Float em JS.
+- Comandos: `material novo` (guiado), `entrada`, `ajustar … para` (com confirmação), `devolver … OS n`, `saldo`, `estoque`.
+- OS pergunta materiais ("quantidade nome" por vírgula; decimal com ponto na lista), resolve contra o catálogo, material inexistente fica pendente de classificação (sem baixa, citado no recibo).
+- Baixa transacional na confirmação: trava itens em ordem determinística, valida saldo antes de mover status, 1 OUT por item, re-confirmação nunca duplica. Estoque insuficiente responde determinístico e mantém CONFIRM.
+- Áudio com lista de materiais do LLM resolve contra o catálogo (match único ganha id; ambíguo/inexistente pendente).
+- `corrigir materiais` apaga e reabre a lista do rascunho. Ajuste sem delta é no-op determinístico.
+
 ## 0.2.0 — Fase 4: Áudio + IA (Groq STT/LLM)
 
 - Notas de voz (`mimetype audio/*`) entram no fluxo guiado: download de mídia via path de `payload.media.url` prefixado com `WAHA_BASE_URL` (host público da url nunca é chamado), cap `WAHA_MEDIA_MAX_BYTES` (16 MiB) → `AUDIO_TOO_LARGE`; mídia não-audio rejeitada sem download (`MEDIA_UNSUPPORTED`).

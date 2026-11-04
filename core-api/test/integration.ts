@@ -158,12 +158,18 @@ async function inbound(body: string, extra: Partial<Payload> = {}): Promise<{ id
   return { id: messageId, text: await reply(messageId) };
 }
 async function states(): Promise<State[]> {
+  // 'states' significa pendências ATIVAS: a linha do operador persiste com
+  // pending_action NULL após qualquer interação (upsert, nunca delete).
   return prisma.$queryRawUnsafe<State[]>(
-    'SELECT pending_action, payload, service_order_id, expires_at, updated_at FROM conversation_states ORDER BY operator_id',
+    'SELECT pending_action, payload, service_order_id, expires_at, updated_at FROM conversation_states WHERE pending_action IS NOT NULL ORDER BY operator_id',
   );
 }
 async function pending(action: string | null): Promise<State> {
   const rows = await states();
+  if (action === null) {
+    assert.equal(rows.length, 0, 'no active pending operation expected');
+    return { pending_action: null, payload: null, service_order_id: null, expires_at: null, updated_at: new Date() };
+  }
   assert.equal(rows.length, 1);
   assert.equal(rows[0]!.pending_action, action);
   return rows[0]!;
@@ -210,9 +216,79 @@ async function seedCustomer(name: string): Promise<string> {
   );
   return rows[0]!.id;
 }
+// Quantidades sempre como texto numeric vindo do PostgreSQL (nunca Float em JS):
+// '10.000' para 10, '2.500' para 2,5. Comparações exatas são feitas sobre ::text.
+type ItemRow = { id: string; name: string; unit: string; quantity: string; min_quantity: string | null; active: boolean };
+async function seedItem(name: string, unit: string, quantity: string, minQuantity: string | null = null): Promise<ItemRow> {
+  const rows = await prisma.$queryRawUnsafe<Array<{ id: string; name: string; unit: string; quantity: string; min_quantity: string | null; active: boolean }>>(
+    'INSERT INTO inventory_items(name, normalized_name, unit, quantity, min_quantity) VALUES($1, $2, $3, $4::numeric, $5::numeric) RETURNING id, name, unit, quantity::text AS quantity, min_quantity::text AS min_quantity, active',
+    name, name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('pt-BR'), unit, quantity, minQuantity,
+  );
+  return rows[0]!;
+}
+async function itemQuantity(itemId: string): Promise<string> {
+  const rows = await prisma.$queryRawUnsafe<Array<{ quantity: string }>>(
+    'SELECT quantity::text FROM inventory_items WHERE id=$1::uuid', itemId,
+  );
+  return rows[0]!.quantity;
+}
+async function seedOrder(description: string, customerName: string): Promise<{ id: string; number: number }> {
+  const customerId = await seedCustomer(customerName);
+  const rows = await prisma.$queryRawUnsafe<Array<{ id: string; number: number }>>(
+    "INSERT INTO service_orders(customer_id, description, status) VALUES($1::uuid, $2, 'CONFIRMADA') RETURNING id, number",
+    customerId, description,
+  );
+  return rows[0]!;
+}
+type MovementRow = {
+  movement_type: string;
+  quantity: string;
+  reason: string | null;
+  inventory_item_id: string;
+  service_order_id: string | null;
+  source_message_id: string | null;
+};
+async function movements(): Promise<MovementRow[]> {
+  return prisma.$queryRawUnsafe<MovementRow[]>(
+    `SELECT sm.movement_type, sm.quantity::text AS quantity, sm.reason,
+            sm.inventory_item_id::text AS inventory_item_id, sm.service_order_id::text AS service_order_id,
+            m.message_id AS source_message_id
+       FROM stock_movements sm LEFT JOIN messages m ON m.id=sm.source_message_id
+      ORDER BY sm.created_at, sm.id`,
+  );
+}
+async function orderItems(orderId: string): Promise<Array<{ raw_name: string; quantity: string; inventory_item_id: string | null }>> {
+  return prisma.$queryRawUnsafe<Array<{ raw_name: string; quantity: string; inventory_item_id: string | null }>>(
+    'SELECT raw_name, quantity::text AS quantity, inventory_item_id::text AS inventory_item_id FROM service_order_items WHERE service_order_id=$1::uuid ORDER BY position',
+    orderId,
+  );
+}
+async function stockCounts(): Promise<{ items: number; orderItems: number; movements: number }> {
+  const [row] = await prisma.$queryRawUnsafe<Array<{ items: number; orderItems: number; movements: number }>>(
+    `SELECT (SELECT count(*)::int FROM inventory_items) AS items,
+            (SELECT count(*)::int FROM service_order_items) AS "orderItems",
+            (SELECT count(*)::int FROM stock_movements) AS movements`,
+  );
+  return row!;
+}
+// Fluxo guiado por texto até a pergunta de materiais (valor já aplicado).
+async function beginOrderToMaterials(description: string, customerName: string, value: string): Promise<Order> {
+  await inbound(description);
+  await inbound(customerName);
+  // Cliente novo: a oferta de cadastro precisa ser aceita antes do valor.
+  await inbound('sim');
+  await pending('VALUE');
+  const order = (await orders()).find((row) => row.description === description);
+  assert.ok(order);
+  const asked = await inbound(value);
+  assert.match(asked.text, /materiais/i);
+  assert.match(asked.text, /2 cabo, 3 disjuntor/);
+  await pending('materials');
+  return order;
+}
 async function reset() {
   // Only the disposable *_test database supplied by verify.sh can reach this operation.
-  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_orders, customers');
+  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, service_orders, inventory_items, customers');
   await prisma.$executeRawUnsafe('ALTER SEQUENCE service_order_number_seq RESTART WITH 1');
   deliveries.length = 0;
   providerAttempts.length = 0;
@@ -449,7 +525,9 @@ const scenarios: Array<[string, () => Promise<void>]> = [
       assert.equal((await orders())[0]!.amount_cents, null);
       assert.equal((await audits(rejected.id)).length, 0);
     }
-    const zero = await inbound('0');
+    // Fase 5: responder o valor pergunta materiais; 'não' fecha o draft vazio e traz o resumo.
+    await inbound('0');
+    const zero = await inbound('não');
     assert.match(zero.text, /R\$ 0,00/);
     assert.equal((await orders())[0]!.amount_cents, 0);
     await pending('CONFIRM');
@@ -537,6 +615,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await orders())[0]!.customer_id, anaLuz);
     assert.equal((await orders())[0]!.description, 'Limpeza detalhada');
     await inbound('1,01');
+    await inbound('não');
     await inbound('ok');
     const beforeQueries = await orders();
     const beforeQueryState = await states();
@@ -647,11 +726,12 @@ const scenarios: Array<[string, () => Promise<void>]> = [
       [id('fifo-description'), 'Revisão FIFO', settings.OPERATOR_LID],
       [id('fifo-customer'), 'Cliente Fluxo', settings.OPERATOR_PHONE],
       [id('fifo-value'), '123,45', settings.OPERATOR_LID],
-      [id('fifo-confirm'), 'confirmo', settings.OPERATOR_PHONE],
+      [id('fifo-materials'), 'não', settings.OPERATOR_PHONE],
+      [id('fifo-confirm'), 'confirmo', settings.OPERATOR_LID],
     ] as const;
     // Persist the intended ordering; concurrent consumers, not network arrival races, are under test.
     for (const [messageId, body, from] of input) await ingest(messageId, body, { from });
-    await Promise.all([tick(), tick(), tick(), tick()]);
+    await Promise.all([tick(), tick(), tick(), tick(), tick()]);
     await tick();
     const rows = await orders();
     assert.equal(rows.length, 1);
@@ -669,10 +749,11 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.deepEqual((await audits(input[0][0])).map((audit) => audit.action), []);
     assert.deepEqual((await audits(input[1][0])).map((audit) => audit.action), ['CREATE']);
     assert.deepEqual((await audits(input[2][0])).map((audit) => audit.action), ['SET_VALUE']);
-    assert.deepEqual((await audits(input[3][0])).map((audit) => audit.action), ['CONFIRM']);
+    assert.deepEqual((await audits(input[3][0])).map((audit) => audit.action), [], 'closing an empty materials draft audits nothing');
+    assert.deepEqual((await audits(input[4][0])).map((audit) => audit.action), ['CONFIRM']);
     const inbox = await prisma.$queryRawUnsafe<Array<{ state: string; attempts: number; last_error: string | null }>>('SELECT state, attempts, last_error FROM webhook_events ORDER BY created_at');
     assert.deepEqual(inbox, input.map(() => ({ state: 'PROCESSED', attempts: 0, last_error: null })));
-    assert.equal(providerAttempts.length, 4);
+    assert.equal(providerAttempts.length, 5);
   }],
   ['restart resumes persisted draft and inbox without duplicate effects', async () => {
     const customerId = await seedCustomer('Cliente Reinício');
@@ -693,6 +774,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await orders())[0]!.customer_id, customerId);
     assert.equal((await orders())[0]!.description, 'Manutenção persistente');
     await inbound('0,01');
+    await inbound('não');
     await inbound('sim');
     assert.equal((await orders())[0]!.amount_cents, 1);
     assert.equal((await orders())[0]!.status, 'CONFIRMADA');
@@ -807,6 +889,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await orders()).length, 1);
     assert.equal((await orders())[0]!.customer_id, anaLuz);
     await inbound('80');
+    await inbound('não');
     await pending('CONFIRM');
     const summary = (await orders())[0]!;
     assert.equal(summary.status, 'AGUARDANDO_CONFIRMACAO');
@@ -831,11 +914,15 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await orders())[0]!.description, 'Limpeza da piscina');
     assert.equal((await orders())[0]!.amount_cents, null);
     const first = await inbound('45,90');
-    assert.match(first.text, /R\$ 45,90/);
+    assert.match(first.text, /materiais/i);
+    const firstSummary = await inbound('não');
+    assert.match(firstSummary.text, /R\$ 45,90/);
+    await pending('CONFIRM');
     await inbound('sim');
     assert.equal((await orders())[0]!.status, 'CONFIRMADA');
     await pending(null);
-    // Second voice note carries an amount: no VALUE step, direct confirmation summary.
+    // Second voice note carries an amount: no VALUE step and no materials
+    // question — the summary comes straight from the LLM extraction.
     // This one also exercises the media fallback (no payload.media.url at all).
     await groqControl('/scenario', { stt: 'Troca de compressor', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Valor', service_description: 'Troca de compressor', service_amount: 300, materials_amount: null, due_date: null } });
     const withValue = id('audio-with-value');
@@ -1075,7 +1162,535 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await audits(dependent)).length, 0);
     const [blocked] = await prisma.$queryRawUnsafe<Array<{ state: string; attempts: number }>>('SELECT state, attempts FROM webhook_events WHERE message_id=$1', dependent);
     assert.deepEqual(blocked, { state: 'PENDING', attempts: 0 });
-    assert.deepEqual(await outbounds(descriptionId), [uncertain]);
+      assert.deepEqual(await outbounds(descriptionId), [uncertain]);
+  }],
+
+  // -------------------------------------------------------------------------
+  // Fase 5 — estoque/materiais. Quantidades chegam como texto numeric do
+  // PostgreSQL ('2.500'); toda comparação de saldo é SQL, nunca texto de reply.
+  // -------------------------------------------------------------------------
+  ['material novo guided flow creates item, opening balance movement and audit', async () => {
+    assert.deepEqual(await stockCounts(), { items: 0, orderItems: 0, movements: 0 });
+    assert.match((await inbound('material novo')).text, /nome/i);
+    const nameState = await pending('matNome');
+    assert.equal(nameState.payload?.matName, undefined);
+    assert.match((await inbound('Cabo Flexível 2,5mm')).text, /unidade/i);
+    const unitState = await pending('matUnidade');
+    assert.equal(unitState.payload?.matName, 'Cabo Flexível 2,5mm');
+    assert.match((await inbound('m')).text, /saldo/i);
+    await pending('matSaldo');
+    // Quantidade inválida não avança e não muda estado (mensagem determinística).
+    const invalid = await inbound('abc');
+    assert.match(invalid.text, /Quantidade inválida\. Use, por exemplo, 2 ou 2,5\./);
+    const stillSaldo = await pending('matSaldo');
+    assert.equal(stillSaldo.payload?.matName, 'Cabo Flexível 2,5mm');
+    assert.equal(stillSaldo.payload?.matUnit, 'm');
+    assert.deepEqual(await stockCounts(), { items: 0, orderItems: 0, movements: 0 });
+    assert.match((await inbound('10')).text, /mínimo/i);
+    const saldoState = await pending('matMinimo');
+    assert.equal(saldoState.payload?.matSaldo, '10');
+    // '-' pula o mínimo opcional (fica NULL).
+    const resumed = await inbound('-');
+    assert.match(resumed.text, /Cabo Flexível 2,5mm/);
+    assert.match(resumed.text, /10 m/);
+    assert.match(resumed.text, /—/);
+    const confirmState = await pending('MATERIAL_CONFIRM');
+    assert.equal(confirmState.payload?.matName, 'Cabo Flexível 2,5mm');
+    assert.equal(confirmState.payload?.matSaldo, '10');
+    const created = await inbound('sim');
+    await pending(null);
+    assert.deepEqual(await stockCounts(), { items: 1, orderItems: 0, movements: 1 });
+    const items = await prisma.$queryRawUnsafe<Array<{ id: string; name: string; unit: string; quantity: string; min_quantity: string | null; active: boolean }>>(
+      'SELECT id, name, unit, quantity::text AS quantity, min_quantity::text AS min_quantity, active FROM inventory_items',
+    );
+    const item = items[0]!;
+    assert.equal(item.name, 'Cabo Flexível 2,5mm');
+    assert.equal(item.unit, 'm');
+    assert.equal(item.quantity, '10.000', 'numeric must arrive as exact SQL text');
+    assert.equal(item.min_quantity, null);
+    assert.equal(item.active, true);
+    const [movement] = await movements();
+    assert.equal(movement.movement_type, 'IN');
+    assert.equal(movement.quantity, '10.000');
+    assert.equal(movement.reason, 'Saldo inicial');
+    assert.equal(movement.inventory_item_id, item.id);
+    assert.equal(movement.service_order_id, null);
+    assert.equal(movement.source_message_id, created.id);
+    assert.ok(
+      (await audits(created.id)).some((entry) => entry.action === 'CREATE' && entry.entity_id === item.id),
+      'material creation must be audited against the new item',
+    );
+    const saldoReply = await inbound('saldo cabo');
+    assert.match(saldoReply.text, /Cabo Flexível 2,5mm: 10 m/);
+    assert.equal(saldoReply.text.includes('mínimo'), false, 'null minimum must not render a minimum part');
+    // O upsert da conversation_state mantém a linha do operador com
+    // pending_action NULL após limpar — semântica dos cenários legados.
+    await pending(null);
+    // 'cancelar' aborta o fluxo guiado sem criar nada.
+    assert.match((await inbound('material novo')).text, /nome/i);
+    await inbound('Parafuso galvanizado');
+    await pending('matUnidade');
+    const cancelled = await inbound('cancelar');
+    assert.match(cancelled.text, /cancelad/i);
+    await pending(null);
+    assert.deepEqual(await stockCounts(), { items: 1, orderItems: 0, movements: 1 });
+  }],
+  ['entrada posts balance, rejects missing material and negated or ambiguous drafts', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10', '2');
+    const okAsk = await inbound('entrada 20 cabo');
+    assert.match(okAsk.text, /Entrada de 20 m de Cabo/);
+    await pending('MATERIAL_CONFIRM');
+    const ok = await inbound('sim');
+    assert.match(ok.text, /Saldo: 30 m/);
+    await pending(null);
+    assert.equal(await itemQuantity(cabo.id), '30.000');
+    let ledger = await movements();
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.movement_type, 'IN');
+    assert.equal(ledger[0]!.quantity, '20.000');
+    assert.equal(ledger[0]!.inventory_item_id, cabo.id);
+    assert.equal(ledger[0]!.service_order_id, null);
+    // Material inexistente responde determinístico e NUNCA cria item.
+    const missing = await inbound('entrada 5 parafuso cego');
+    assert.match(missing.text, /Não encontrei material "parafuso cego"\./);
+    assert.match(missing.text, /material novo/);
+    assert.equal((await states()).length, 0);
+    assert.deepEqual(await stockCounts(), { items: 1, orderItems: 0, movements: 1 });
+    // Quantidade inválida (0) nem abre confirmação.
+    const invalid = await inbound('entrada 0 cabo');
+    assert.match(invalid.text, /Quantidade inválida\. Use, por exemplo, 2 ou 2,5\./);
+    assert.equal((await states()).length, 0);
+    assert.equal(await itemQuantity(cabo.id), '30.000');
+    // Confirmação negada não altera saldo nem gera movement.
+    await inbound('entrada 7 cabo');
+    await pending('MATERIAL_CONFIRM');
+    const denied = await inbound('não');
+    assert.match(denied.text, /cancelad/i);
+    await pending(null);
+    assert.equal(await itemQuantity(cabo.id), '30.000');
+    assert.equal((await movements()).length, 1);
+    // Ambígua: disambiguação preserva a quantidade do comando original.
+    const solda = await seedItem('Cabo Solda', 'kg', '4');
+    const ambiguous = await inbound('entrada 2,5 cabo');
+    assert.match(ambiguous.text, /Cabo/);
+    assert.match(ambiguous.text, /Cabo Solda/);
+    const choose = await pending('AWAITING_DISAMBIGUATION');
+    assert.equal(choose.payload?.purpose, 'MATERIAL');
+    assert.equal(choose.payload?.name, 'cabo');
+    assert.equal(choose.payload?.entryQuantity, '2.5');
+    const candidates = choose.payload?.candidates as Array<{ id: string; name: string }>;
+    assert.deepEqual(new Set(candidates.map((candidate) => candidate.id)), new Set([cabo.id, solda.id]));
+    const selected = candidates.findIndex((candidate) => candidate.id === solda.id) + 1;
+    // Escolha em comando de estoque executa a entrada imediatamente.
+    const posted = await inbound(String(selected));
+    assert.match(posted.text, /Entrada registrada: Cabo Solda \+2,5 kg\. Saldo: 6,5 kg\./);
+    await pending(null);
+    assert.equal(await itemQuantity(solda.id), '6.500');
+    ledger = await movements();
+    assert.equal(ledger.length, 2);
+    const last = ledger[ledger.length - 1]!;
+    assert.equal(last.movement_type, 'IN');
+    assert.equal(last.quantity, '2.500');
+    assert.equal(last.inventory_item_id, solda.id);
+    assert.equal(last.source_message_id, posted.id);
+    assert.equal(await itemQuantity(cabo.id), '30.000');
+  }],
+  ['ajustar moves balance up and down with confirmation and exact delta ledger', async () => {
+    const disjuntor = await seedItem('Disjuntor', 'un', '5', '1');
+    const missing = await inbound('ajustar torneira para 2');
+    assert.match(missing.text, /Não encontrei material "torneira"\./);
+    assert.match(missing.text, /material novo/);
+    assert.equal((await states()).length, 0);
+    assert.deepEqual(await stockCounts(), { items: 1, orderItems: 0, movements: 0 });
+    const upAsk = await inbound('ajustar disjuntor para 12');
+    assert.match(upAsk.text, /Ajustar Disjuntor de 5 un para 12 un\? Responda sim ou cancelar\./);
+    await pending('MATERIAL_CONFIRM');
+    const up = await inbound('sim');
+    assert.match(up.text, /Ajuste registrado: Disjuntor agora com 12 un \(\+7\)\./);
+    await pending(null);
+    assert.equal(await itemQuantity(disjuntor.id), '12.000');
+    const downAsk = await inbound('ajustar disjuntor para 3');
+    assert.match(downAsk.text, /Ajustar Disjuntor de 12 un para 3 un\? Responda sim ou cancelar\./);
+    await pending('MATERIAL_CONFIRM');
+    const down = await inbound('sim');
+    assert.match(down.text, /Ajuste registrado: Disjuntor agora com 3 un \(-9\)\./);
+    await pending(null);
+    assert.equal(await itemQuantity(disjuntor.id), '3.000');
+    // Decimal com vírgula: delta 0,75 e saldo 3,750 exatos no SQL.
+    const decimalAsk = await inbound('ajustar disjuntor para 3,75');
+    assert.match(decimalAsk.text, /Ajustar Disjuntor de 3 un para 3,75 un/);
+    await pending('MATERIAL_CONFIRM');
+    const decimal = await inbound('sim');
+    assert.match(decimal.text, /Ajuste registrado: Disjuntor agora com 3,75 un \(\+0,75\)\./);
+    await pending(null);
+    assert.equal(await itemQuantity(disjuntor.id), '3.750');
+    const ledger = await movements();
+    assert.deepEqual(ledger.map((entry) => [entry.movement_type, entry.quantity, entry.reason]), [
+      ['ADJUST', '7.000', 'Ajuste para 12 un'],
+      ['ADJUST', '9.000', 'Ajuste para 3 un'],
+      ['ADJUST', '0.750', 'Ajuste para 3,75 un'],
+    ]);
+    // Ajuste para o saldo atual: delta 0 vira no-op determinístico (nunca um
+    // movement de quantidade 0, que violaria o CHECK quantity>0).
+    const noopAsk = await inbound('ajustar disjuntor para 3,75');
+    assert.match(noopAsk.text, /Ajustar Disjuntor de 3,75 un para 3,75 un/);
+    await pending('MATERIAL_CONFIRM');
+    const noop = await inbound('sim');
+    assert.match(noop.text, /Saldo de Disjuntor já é 3,75 un\. Nada a ajustar\./);
+    await pending(null);
+    assert.equal(await itemQuantity(disjuntor.id), '3.750');
+    assert.equal((await movements()).length, 3);
+    // 'não' na confirmação do ajuste cancela sem tocar saldo ou ledger.
+    await inbound('ajustar disjuntor para 9');
+    await pending('MATERIAL_CONFIRM');
+    const denied = await inbound('não');
+    assert.match(denied.text, /cancelad/i);
+    await pending(null);
+    assert.equal(await itemQuantity(disjuntor.id), '3.750');
+    assert.equal((await movements()).length, 3);
+  }],
+  ['devolver posts RETURN tied to the OS; unknown OS is rejected deterministically', async () => {
+    const fita = await seedItem('Fita Isolante', 'un', '10');
+    const order = await seedOrder('Troca de tomada', 'Cliente Devolução');
+    const ask = await inbound(`devolver 2 fita OS ${order.number}`);
+    assert.match(ask.text, /Devolução de 2 un de Fita Isolante \(OS \d{6}\)\? Responda sim ou cancelar\./);
+    await pending('MATERIAL_CONFIRM');
+    const posted = await inbound('sim');
+    assert.match(posted.text, /Devolução registrada: Fita Isolante \+2 un\. Saldo: 12 un\./);
+    await pending(null);
+    assert.equal(await itemQuantity(fita.id), '12.000');
+    const [movement] = await movements();
+    assert.equal(movement.movement_type, 'RETURN');
+    assert.equal(movement.quantity, '2.000');
+    assert.equal(movement.inventory_item_id, fita.id);
+    assert.equal(movement.service_order_id, order.id);
+    assert.equal(movement.source_message_id, posted.id);
+    // OS inexistente: mensagem determinística, nenhum estado, nenhum movement.
+    const missing = await inbound('devolver 1 fita OS 999');
+    assert.match(missing.text, /OS não encontrada\./);
+    assert.equal((await states()).length, 0);
+    assert.equal(await itemQuantity(fita.id), '12.000');
+    assert.equal((await movements()).length, 1);
+    // OS cancelada também aceita devolução (qualquer status) — devolve para a mesma OS.
+    await prisma.$executeRawUnsafe("UPDATE service_orders SET status='CANCELADA' WHERE id=$1::uuid", order.id);
+    await inbound(`devolver 1 fita OS ${order.number}`);
+    await pending('MATERIAL_CONFIRM');
+    await inbound('sim');
+    await pending(null);
+    const ledger = await movements();
+    assert.equal(ledger.length, 2);
+    assert.equal(ledger[1]!.movement_type, 'RETURN');
+    assert.equal(ledger[1]!.service_order_id, order.id);
+    assert.equal(await itemQuantity(fita.id), '13.000');
+  }],
+  ['saldo and estoque answer from SQL with single, ambiguous and empty results', async () => {
+    const empty = await inbound('estoque');
+    assert.match(empty.text, /Estoque vazio\./);
+    assert.equal((await states()).length, 0);
+    const cabo = await seedItem('Cabo', 'm', '10', '2');
+    const solda = await seedItem('Cabo Solda', 'kg', '4');
+    const disjuntor = await seedItem('Disjuntor', 'un', '5', '1');
+    const inactive = await seedItem('Antiga Fita', 'un', '9');
+    await prisma.$executeRawUnsafe('UPDATE inventory_items SET active=false WHERE id=$1::uuid', inactive.id);
+    const noMatch = await inbound('saldo zinco');
+    assert.match(noMatch.text, /Não encontrei material com esse nome: zinco\./);
+    assert.equal((await states()).length, 0);
+    const single = await inbound('saldo disjuntor');
+    assert.match(single.text, /Disjuntor: 5 un \(mínimo 1 un\)/);
+    assert.equal((await states()).length, 0);
+    // Ambíguo lista TODOS os saldos, sem pedir escolha.
+    const ambiguous = await inbound('saldo cabo');
+    assert.match(ambiguous.text, /Cabo: 10 m \(mínimo 2 m\)/);
+    assert.match(ambiguous.text, /Cabo Solda: 4 kg/);
+    assert.equal((await states()).length, 0);
+    const listing = await inbound('estoque');
+    const caboAt = listing.text.indexOf('Cabo — 10 m');
+    const soldaAt = listing.text.indexOf('Cabo Solda — 4 kg');
+    const disjuntorAt = listing.text.indexOf('Disjuntor — 5 un');
+    assert.ok(caboAt >= 0 && soldaAt > caboAt && disjuntorAt > soldaAt, 'estoque must list active items ordered by name');
+    assert.equal(listing.text.includes('Antiga Fita'), false, 'inactive items must not appear in estoque');
+    assert.equal((await states()).length, 0);
+    assert.deepEqual([cabo.quantity, solda.quantity, disjuntor.quantity], ['10.000', '4.000', '5.000']);
+    assert.equal((await movements()).length, 0, 'queries never post movements');
+  }],
+  ['order with materials: confirm posts one OUT per item and re-confirmation never duplicates', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    const disjuntor = await seedItem('Disjuntor', 'un', '5');
+    const order = await beginOrderToMaterials('Instalação de quadro', 'Cliente Materiais', '100');
+    const ask = await inbound('2.5 cabo, 3 disjuntor');
+    assert.match(ask.text, /Materiais: 2,5 Cabo, 3 Disjuntor/);
+    await pending('CONFIRM');
+    assert.equal((await orders())[0]!.status, 'AGUARDANDO_CONFIRMACAO');
+    // Itens nascem na mesma transação do fechamento do draft, antes do resumo.
+    assert.deepEqual(await orderItems(order.id), [
+      { raw_name: 'cabo', quantity: '2.500', inventory_item_id: cabo.id },
+      { raw_name: 'disjuntor', quantity: '3.000', inventory_item_id: disjuntor.id },
+    ]);
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    assert.match(confirmed.text, /Materiais: 2,5 Cabo, 3 Disjuntor/);
+    await pending(null);
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    assert.deepEqual(await orderItems(order.id), [
+      { raw_name: 'cabo', quantity: '2.500', inventory_item_id: cabo.id },
+      { raw_name: 'disjuntor', quantity: '3.000', inventory_item_id: disjuntor.id },
+    ]);
+    const ledger = await movements();
+    assert.equal(ledger.length, 2, 'exactly one OUT per item');
+    const caboOut = ledger.find((entry) => entry.inventory_item_id === cabo.id)!;
+    const disjuntorOut = ledger.find((entry) => entry.inventory_item_id === disjuntor.id)!;
+    for (const [entry, quantity] of [[caboOut, '2.500'], [disjuntorOut, '3.000']] as const) {
+      assert.equal(entry.movement_type, 'OUT');
+      assert.equal(entry.quantity, quantity);
+      assert.equal(entry.service_order_id, order.id);
+      assert.equal(entry.source_message_id, confirmed.id);
+    }
+    assert.equal(await itemQuantity(cabo.id), '7.500');
+    assert.equal(await itemQuantity(disjuntor.id), '2.000');
+    assert.deepEqual((await audits(confirmed.id)).map((entry) => entry.action), ['CONFIRM']);
+    // Idempotência da baixa: re-confirmação não duplica movements nem itens.
+    const second = await inbound('sim');
+    assert.match(second.text, /Não há confirmação pendente/);
+    assert.equal((await movements()).length, 2);
+    assert.deepEqual(await orderItems(order.id).then((rows) => rows.length), 2);
+    assert.equal(await itemQuantity(cabo.id), '7.500');
+    assert.equal(await itemQuantity(disjuntor.id), '2.000');
+    assert.equal((await audits(second.id)).length, 0);
+  }],
+  ['insufficient stock blocks CONFIRM deterministically; entrada then sim completes', async () => {
+    const rolo = await seedItem('Rolo', 'un', '2');
+    const order = await beginOrderToMaterials('Troca de rolo completo', 'Cliente Estoque Baixo', '80');
+    await inbound('5 rolo');
+    await pending('CONFIRM');
+    const blocked = await inbound('sim');
+    assert.match(blocked.text, /Estoque insuficiente para confirmar: rolo \(disponível: 2 un\)\./);
+    assert.match(blocked.text, /ou ajuste e confirme novamente\./);
+    await pending('CONFIRM');
+    assert.equal((await orders())[0]!.status, 'AGUARDANDO_CONFIRMACAO', 'state stays awaiting confirmation');
+    assert.deepEqual(await orderItems(order.id), [{ raw_name: 'rolo', quantity: '5.000', inventory_item_id: rolo.id }]);
+    assert.equal(await itemQuantity(rolo.id), '2.000', 'blocked confirm must not touch the balance');
+    assert.equal((await movements()).length, 0);
+    // 'entrada' resolve o estoque durante CONFIRM e devolve o resumo da OS:
+    // o estado de confirmação sobrevive e o 'sim' seguinte confirma a OS.
+    const entradaDuring = await inbound('entrada 4 rolo');
+    assert.match(entradaDuring.text, /Entrada de 4 un de Rolo/);
+    await pending('MATERIAL_CONFIRM');
+    const posted = await inbound('sim');
+    assert.match(posted.text, /Entrada registrada: Rolo \+4 un\. Saldo: 6 un\./);
+    assert.match(posted.text, /Troca de rolo completo/);
+    assert.match(posted.text, /Confirma\? Responda sim ou cancelar\./);
+    await pending('CONFIRM');
+    assert.equal(await itemQuantity(rolo.id), '6.000');
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    await pending(null);
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    const ledger = await movements();
+    assert.equal(ledger.length, 2);
+    const out = ledger.find((entry) => entry.movement_type === 'OUT')!;
+    assert.equal(out.quantity, '5.000');
+    assert.equal(out.service_order_id, order.id);
+    assert.equal(await itemQuantity(rolo.id), '1.000');
+  }],
+  ['unclassified material is quoted in receipt and never posts stock', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    const order = await beginOrderToMaterials('Instalação de tela', 'Cliente Pendente', '120');
+    const ask = await inbound('2 cabo, 3 tela metalica');
+    assert.match(ask.text, /Materiais: 2 Cabo, 3 tela metalica \(pendente de cadastro\)/);
+    assert.match(ask.text, /Pendente de cadastro: tela metalica/);
+    await pending('CONFIRM');
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    assert.match(confirmed.text, /Pendente de cadastro: tela metalica/);
+    await pending(null);
+    assert.deepEqual(await orderItems(order.id), [
+      { raw_name: 'cabo', quantity: '2.000', inventory_item_id: cabo.id },
+      { raw_name: 'tela metalica', quantity: '3.000', inventory_item_id: null },
+    ]);
+    const ledger = await movements();
+    assert.equal(ledger.length, 1, 'unclassified item must not post any movement');
+    assert.equal(ledger[0]!.movement_type, 'OUT');
+    assert.equal(ledger[0]!.inventory_item_id, cabo.id);
+    assert.equal(ledger[0]!.quantity, '2.000');
+    assert.equal(await itemQuantity(cabo.id), '8.000');
+  }],
+  ['audio extraction fills materialsDraft, skips the question; without materials it asks', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    await seedCustomer('Cliente Audio Materiais');
+    // Entradas inválidas do LLM (nome vazio, quantidade negativa) são descartadas pelo zod.
+    await groqControl('/scenario', {
+      stt: 'Instalacao de tela de protecao',
+      llm: {
+        intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Materiais', service_description: 'Instalacao de tela',
+        service_amount: 80, materials_amount: null, due_date: null,
+        materials: [{ name: 'cabo', quantity: 2 }, { name: 'tela metalica', quantity: 1 }],
+      },
+    });
+    const audioId = id('audio-materials');
+    await ingest(audioId, null, audioMedia(audioId));
+    await tick();
+    const offered = await reply(audioId);
+    assert.match(offered, /Materiais: 2 Cabo, 1 tela metalica \(pendente de cadastro\)/);
+    assert.match(offered, /Pendente de cadastro: tela metalica/);
+    const state = await pending('CONFIRM');
+    const draft = state.payload?.materialsDraft as Array<{ rawName: string; quantity: string }>;
+    assert.deepEqual(draft.map((entry) => entry.rawName), ['cabo', 'tela metalica']);
+    const order = (await orders())[0]!;
+    assert.equal(order.status, 'AGUARDANDO_CONFIRMACAO');
+    assert.equal(order.amount_cents, 8000);
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    await pending(null);
+    const ledger = await movements();
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.movement_type, 'OUT');
+    assert.equal(ledger[0]!.inventory_item_id, cabo.id);
+    assert.equal(ledger[0]!.quantity, '2.000');
+    assert.equal(await itemQuantity(cabo.id), '8.000');
+    const ledgerEntries = await groqLedger();
+    assert.equal(ledgerEntries.entries.filter((entry) => entry.kind === 'stt').length, 1);
+    assert.equal(ledgerEntries.entries.filter((entry) => entry.kind === 'llm').length, 1);
+    // Material malformado na extração (quantidade <= 0) invalida a extração
+    // INTEIRA — fallback determinístico, igual à regra do due_date.
+    await groqControl('/scenario', {
+      stt: 'Troca de pecas com material ruim',
+      llm: {
+        intent: 'REGISTRAR_SERVICO', customer_name: null, service_description: 'Troca de pecas',
+        service_amount: null, materials_amount: null, due_date: null,
+        materials: [{ name: 'cabo', quantity: -3 }],
+      },
+    });
+    const badMaterialsId = id('audio-bad-materials');
+    await ingest(badMaterialsId, null, audioMedia(badMaterialsId));
+    await tick();
+    const fallback = await reply(badMaterialsId);
+    assert.match(fallback, /Ouvi: "Troca de pecas com material ruim"/);
+    assert.match(fallback, /não consegui interpretar/i);
+    const fallbackState = await pending('CUSTOMER_NAME');
+    // Extração rejeitada = nada do LLM é confiável: a TRANSCRIÇÃO inteira
+    // vira a descrição do fluxo guiado (contrato da Fase 4).
+    assert.equal(fallbackState.payload?.description, 'Troca de pecas com material ruim');
+    assert.equal((await orders()).length, 1, 'no order may be created from a rejected extraction');
+    await inbound('cancelar');
+    await pending(null);
+    // Sem materials extraídos E sem valor, o fluxo PERGUNTA materiais na
+    // mesma gramática do texto (após responder o valor).
+    await seedCustomer('Cliente Audio Sem Materiais');
+    await groqControl('/scenario', {
+      stt: 'Reparo de portao',
+      llm: {
+        intent: 'REGISTRAR_SERVICO', customer_name: 'Cliente Audio Sem Materiais', service_description: 'Reparo de portao',
+        service_amount: null, materials_amount: null, due_date: null,
+      },
+    });
+    const plainAudioId = id('audio-no-materials');
+    await ingest(plainAudioId, null, audioMedia(plainAudioId));
+    await tick();
+    assert.match(await reply(plainAudioId), /valor/i);
+    await pending('VALUE');
+    const asked = await inbound('60');
+    assert.match(asked.text, /materiais/i);
+    assert.match(asked.text, /2 cabo, 3 disjuntor/);
+    await pending('materials');
+    const declined = await inbound('não');
+    assert.match(declined.text, /R\$ 60,00/);
+    assert.doesNotMatch(declined.text, /Materiais:/);
+    await pending('CONFIRM');
+    const plain = await inbound('sim');
+    assert.match(plain.text, /confirmada/i);
+    await pending(null);
+    assert.deepEqual(await stockCounts(), { items: 1, orderItems: 2, movements: 1 });
+  }],
+  ['malformed materials list re-asks preserving state; corrigir materiais clears the draft', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    const disjuntor = await seedItem('Disjuntor', 'un', '5');
+    const order = await beginOrderToMaterials('Reforma de quadro', 'Cliente Correção', '100');
+    // Segmento sem quantidade re-pergunta com o estado intacto (nada inserido).
+    const malformed = await inbound('2 cabo, so cabo');
+    assert.match(malformed.text, /Não entendi a lista\. Use "quantidade nome" por item, separado por vírgula\./);
+    assert.match(malformed.text, /Ex\.: 2.5 cabo, 3 disjuntor/);
+    await pending('materials');
+    assert.deepEqual(await orderItems(order.id), []);
+    assert.equal((await orders())[0]!.amount_cents, 10000);
+    const good = await inbound('2 cabo, 1 disjuntor');
+    assert.match(good.text, /Materiais: 2 Cabo, 1 Disjuntor/);
+    await pending('CONFIRM');
+    assert.equal((await orderItems(order.id)).length, 2);
+    // 'corrigir materiais' limpa o draft (itens apagados) e re-pergunta.
+    const corrected = await inbound('corrigir materiais');
+    assert.match(corrected.text, /materiais/i);
+    assert.match(corrected.text, /2 cabo, 3 disjuntor/);
+    await pending('materials');
+    assert.deepEqual(await orderItems(order.id), [], 'clearing the draft must remove the drafted items');
+    const declined = await inbound('não');
+    assert.match(declined.text, /Confirma|confirma/);
+    assert.doesNotMatch(declined.text, /Materiais:/);
+    await pending('CONFIRM');
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    await pending(null);
+    assert.deepEqual(await stockCounts(), { items: 2, orderItems: 0, movements: 0 });
+    assert.equal(await itemQuantity(cabo.id), '10.000');
+    assert.equal(await itemQuantity(disjuntor.id), '5.000');
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+  }],
+  ['confirmed orders are immutable: no items, balances or movements change afterwards', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    const order = await beginOrderToMaterials('Troca de cabo queimado', 'Cliente Imutável', '90');
+    await inbound('1 cabo');
+    await pending('CONFIRM');
+    const confirmed = await inbound('sim');
+    assert.match(confirmed.text, /confirmada/i);
+    await pending(null);
+    const itemsBefore = await orderItems(order.id);
+    assert.equal(await itemQuantity(cabo.id), '9.000');
+    assert.equal((await movements()).length, 1);
+    // 'corrigir materiais' sem OS em edição não pode reabrir nada.
+    const noEdit = await inbound('corrigir materiais');
+    assert.match(noEdit.text, /Não há OS em edição/);
+    await pending(null);
+    // Texto solto pós-confirmação nunca altera itens da OS confirmada.
+    const loose = await inbound('2 cabo');
+    assert.match(loose.text, /nome do cliente/i);
+    await pending('CUSTOMER_NAME');
+    assert.deepEqual(await orderItems(order.id), itemsBefore);
+    assert.equal(await itemQuantity(cabo.id), '9.000');
+    assert.equal((await movements()).length, 1);
+    assert.equal((await orders())[0]!.status, 'CONFIRMADA');
+    await inbound('cancelar');
+    await pending(null);
+    assert.deepEqual(await orderItems(order.id), itemsBefore);
+  }],
+  ['concurrent messages with a materials answer stay FIFO without reordering stock', async () => {
+    const cabo = await seedItem('Cabo', 'm', '10');
+    await seedCustomer('Cliente FIFO');
+    const input = [
+      [id('fifo-mat-description'), 'Troca FIFO com materiais', settings.OPERATOR_LID],
+      [id('fifo-mat-customer'), 'Cliente FIFO', settings.OPERATOR_PHONE],
+      [id('fifo-mat-value'), '50', settings.OPERATOR_LID],
+      [id('fifo-mat-materials'), '2 cabo', settings.OPERATOR_PHONE],
+      [id('fifo-mat-confirm'), 'confirmo', settings.OPERATOR_LID],
+    ] as const;
+    for (const [messageId, body, from] of input) await ingest(messageId, body, { from });
+    await Promise.all([tick(), tick(), tick(), tick(), tick()]);
+    await tick();
+    assert.match(await reply(input[0][0]), /nome do cliente/i);
+    assert.match(await reply(input[1][0]), /valor/i);
+    assert.match(await reply(input[2][0]), /materiais/i);
+    assert.match(await reply(input[3][0]), /Materiais: 2 Cabo/);
+    assert.match(await reply(input[4][0]), /confirmada/i);
+    const rows = await orders();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, 'CONFIRMADA');
+    assert.equal(rows[0]!.amount_cents, 5000);
+    assert.deepEqual(await orderItems(rows[0]!.id), [{ raw_name: 'cabo', quantity: '2.000', inventory_item_id: cabo.id }]);
+    const ledger = await movements();
+    assert.equal(ledger.length, 1);
+    assert.equal(ledger[0]!.movement_type, 'OUT');
+    assert.equal(ledger[0]!.quantity, '2.000');
+    assert.equal(ledger[0]!.service_order_id, rows[0]!.id);
+    assert.equal(await itemQuantity(cabo.id), '8.000');
+    await pending(null);
   }],
 ];
 
