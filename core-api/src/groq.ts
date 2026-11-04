@@ -44,8 +44,11 @@ export async function transcribeAudio(cfg: Config, audio: Buffer, filename: stri
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 30_000);
   try {
+    // Groq faz sniffing pela EXTENSÃO do filename no multipart: notas de voz do
+    // WhatsApp chegam como .oga, que não está na lista aceita (ogg/opus estão).
+    const uploadName = filename.replace(/\.oga$/i, '.ogg');
     const form = new FormData();
-    form.append('file', new Blob([new Uint8Array(audio)]), filename);
+    form.append('file', new Blob([new Uint8Array(audio)]), uploadName);
     form.append('model', cfg.GROQ_STT_MODEL);
     form.append('temperature', '0');
     form.append('response_format', 'json');
