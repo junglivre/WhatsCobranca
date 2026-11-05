@@ -53,6 +53,12 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - Dinheiro em `value_cents` integer; conversão para reais só dentro do adapter.
 - Credenciais (`ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`) só no `.env` local, nunca em código, teste ou log de erro (erros do adapter truncam corpo e omitem headers).
 
+## Invariantes de cadastro e cancelamento (Fase 6.5)
+
+- `billing_opt_in` começa false. Só ofereça envio financeiro ao cliente se telefone e consentimento explícito existirem; use `outbound_messages` com `dedup_key` `charge-send:<chargeId>`, nunca envie direto pelo adapter WAHA.
+- `cancelar OS <n>` bloqueia enquanto houver cobrança PENDING/OVERDUE. Em OS CONFIRMADA, trava os itens, recompõe o saldo e grava um RETURN por item na mesma transação que muda o status para CANCELADA. A guarda de status torna a operação idempotente.
+- Dados de endereço usam os campos separados. O comando `endereco` exige `|` entre nome e endereço para nomes com espaços não terem parsing ambíguo.
+
 ## Antes de abrir PR
 
 - Rode `npm run verify` (requer Docker Compose ≥ 2.24.4) e cole a saída completa.

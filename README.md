@@ -157,13 +157,27 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 - `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
 - `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
-- `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas **exige** CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
+- `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas exige CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
+
+### Cadastro e ciclo de vida da OS (Fase 6.5)
+
+Cadastre o contato antes de liberar mensagens financeiras:
+
+- `telefone <nome> <número>` aceita 10 a 13 dígitos com DDI.
+- `endereco <nome> | <rua>, <número>, <bairro>, <cidade>/<UF>, <CEP>` usa `|` para separar um nome com espaços do endereço.
+- `email <nome> <endereço>` valida o formato básico.
+- `autorizar <nome>` libera cobranças no WhatsApp. `revogar <nome>` interrompe novos envios.
+- `cliente <nome>` mostra CPF/CNPJ, contato, endereço, consentimento, total de OS, cobrado e recebido.
+- `histórico <nome>` mostra as cinco OS mais recentes e o estado da cobrança.
+- `cancelar OS <n>` sempre pede confirmação. Para uma OS confirmada, o sistema registra RETURN e recompõe o estoque na mesma transação. Uma cobrança PENDING ou OVERDUE bloqueia o cancelamento até você executar `cancelar cobrança OS <n>`.
+
+Depois de criar um Pix, o bot só pergunta se deve enviar a cobrança ao cliente quando há telefone cadastrado e `autorizar` foi executado. A mensagem entra na mesma outbox do sistema, com deduplicação por cobrança.
 
 **Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
 
-**Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador). A notificação ao cliente final NÃO é automática (sem consentimento/frequência configurados).
+**Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
 
-**Limitações desta fase:** envio da cobrança ao cliente final não existe (cadastro ainda não tem telefone/opt-in — o copia-e-cola vai para o operador repassar); boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); NFS-e tem porta+tabela mas nenhum fluxo de conversa (Fase 7); custo médio de material segue fora.
+**Limitações desta fase:** boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); NFS-e tem porta+tabela mas nenhum fluxo de conversa (Fase 7); custo médio de material segue fora.
 
 ## Verificação isolada
 

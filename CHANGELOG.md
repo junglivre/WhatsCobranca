@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 — Cadastro financeiro e cancelamento de OS
+
+- Clientes passam a guardar telefone, e-mail, endereço e consentimento financeiro explícito. Comandos: `telefone`, `email`, `endereco`, `autorizar`, `revogar`, `cliente` e `histórico`.
+- Pix só oferece envio ao cliente após telefone cadastrado e autorização explícita. O envio usa a outbox existente e deduplica por cobrança.
+- `cancelar OS <n>` bloqueia cobrança aberta e estorna os materiais confirmados com movimentos RETURN na mesma transação.
+
 ## 0.4.0 — Fase 6: Financeiro plugável
 
 - Portas `BillingProvider`/`InvoiceProvider` + registry por env (`BILLING_PROVIDER`, `INVOICE_PROVIDER`): provedores são adapters trocáveis, nunca acoplados ao domínio. Adapter `manual` é a referência mínima para novos provedores; NFS-e fica pronta para adapter do Portal Nacional direto (sem terceiro) ou Asaas (Fase 7).

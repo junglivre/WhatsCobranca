@@ -28,6 +28,15 @@ model Customer {
   name String
   normalizedName String @map("normalized_name")
   cpfCnpj String? @map("cpf_cnpj")
+  phone String?
+  email String?
+  addressStreet String? @map("address_street")
+  addressNumber String? @map("address_number")
+  addressDistrict String? @map("address_district")
+  addressCity String? @map("address_city")
+  addressState String? @map("address_state") @db.Char(2)
+  addressZip String? @map("address_zip")
+  billingOptIn Boolean @default(false) @map("billing_opt_in")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   orders ServiceOrder[]
   providerRefs CustomerProviderRef[]

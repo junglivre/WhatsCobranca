@@ -70,10 +70,63 @@ type ConversationPayload = {
   chargeDbId?: string;
   receiptCents?: number;
   receiptMethod?: 'CASH' | 'EXTERNAL_PIX';
+  // Alterações de cadastro aguardando escolha quando o nome é ambíguo.
+  customerUpdate?: {
+    kind: 'PHONE' | 'EMAIL' | 'ADDRESS' | 'BILLING_OPT_IN';
+    value: string | boolean | CustomerAddress;
+  };
+  cancelOrderId?: string;
+  cancelOrderNumber?: number;
+  chargeSendTo?: string;
+  chargeSendBody?: string;
+  chargeSendId?: string;
   // Comando `cpf <nome> <documento>` com nome ambíguo: o documento já
   // validado viaja no payload enquanto o operador escolhe o cliente.
   cpfDoc?: string;
 };
+
+type CustomerAddress = {
+  street: string;
+  number: string;
+  district: string;
+  city: string;
+  state: string;
+  zip: string;
+};
+
+type CustomerContactRow = CustomerRow & {
+  cpf_cnpj: string | null;
+  phone: string | null;
+  email: string | null;
+  address_street: string | null;
+  address_number: string | null;
+  address_district: string | null;
+  address_city: string | null;
+  address_state: string | null;
+  address_zip: string | null;
+  billing_opt_in: boolean;
+};
+
+type CancelOrderRow = {
+  id: string;
+  number: number;
+  status: string;
+  customer: string;
+  amount_cents: number | null;
+};
+
+type ChargeSendRow = {
+  id: string;
+  number: number;
+  customer: string;
+  description: string;
+  phone: string;
+  billing_opt_in: boolean;
+  amount_cents: number;
+  due_date: Date | string | null;
+  pix_copy_paste: string | null;
+};
+
 
 const thirtyMinutes = () => new Date(Date.now() + 30 * 60 * 1000);
 const clean = (value: string) => value.trim();
@@ -155,6 +208,39 @@ function payloadOf(value: unknown): ConversationPayload {
     receiptCents: positiveCents(record.receiptCents),
     receiptMethod: record.receiptMethod === 'CASH' || record.receiptMethod === 'EXTERNAL_PIX' ? record.receiptMethod : undefined,
     cpfDoc: typeof record.cpfDoc === 'string' && /^\d{11}(?:\d{3})?$/.test(record.cpfDoc) ? record.cpfDoc : undefined,
+    customerUpdate: (() => {
+      const update = record.customerUpdate;
+      if (typeof update !== 'object' || update === null) return undefined;
+      const kind = (update as JsonRecord).kind;
+      const updateValue = (update as JsonRecord).value;
+      if (kind === 'PHONE' || kind === 'EMAIL') {
+        return typeof updateValue === 'string' && updateValue.length > 0 ? { kind, value: updateValue } : undefined;
+      }
+      if (kind === 'BILLING_OPT_IN') {
+        return typeof updateValue === 'boolean' ? { kind, value: updateValue } : undefined;
+      }
+      if (kind === 'ADDRESS' && typeof updateValue === 'object' && updateValue !== null) {
+        const address = updateValue as JsonRecord;
+        const fields = ['street', 'number', 'district', 'city', 'state', 'zip'] as const;
+        if (fields.every((field) => typeof address[field] === 'string' && (address[field] as string).length > 0)) {
+          return {
+            kind,
+            value: {
+              street: address.street as string, number: address.number as string, district: address.district as string,
+              city: address.city as string, state: address.state as string, zip: address.zip as string,
+            },
+          };
+        }
+      }
+      return undefined;
+    })(),
+    cancelOrderId: typeof record.cancelOrderId === 'string' && record.cancelOrderId.length > 0 ? record.cancelOrderId : undefined,
+    cancelOrderNumber: typeof record.cancelOrderNumber === 'number' && Number.isSafeInteger(record.cancelOrderNumber) && record.cancelOrderNumber > 0
+      ? record.cancelOrderNumber
+      : undefined,
+    chargeSendTo: typeof record.chargeSendTo === 'string' && /^\d{10,13}@c\.us$/.test(record.chargeSendTo) ? record.chargeSendTo : undefined,
+    chargeSendBody: typeof record.chargeSendBody === 'string' && record.chargeSendBody.length > 0 ? record.chargeSendBody : undefined,
+    chargeSendId: typeof record.chargeSendId === 'string' && record.chargeSendId.length > 0 ? record.chargeSendId : undefined,
   };
 }
 
@@ -1318,11 +1404,27 @@ async function executeChargeCreation(
       );
     }
   }
-  await saveState(tx, operatorId, null, null, null, replyTo);
   const base = `Cobrança criada: ${osLabel(order.number)} · ${method === 'PIX' ? 'Pix' : 'Boleto'} · ${formatMoney(order.amount_cents)} · vencimento ${formatDue(dueDate)}.`;
   const extra = method === 'PIX'
     ? pixBlock
     : `\nBoleto ${created.providerChargeId}: link disponível no painel Asaas.`;
+  const contact = method === 'PIX' && pixBlock
+    ? (await tx.$queryRawUnsafe<Array<{ phone: string | null; billing_opt_in: boolean }>>(
+      'SELECT phone, billing_opt_in FROM customers WHERE id=$1::uuid', order.customer_id,
+    ))[0]
+    : undefined;
+  if (contact?.phone && contact.billing_opt_in) {
+    const to = `${contact.phone}@c.us`;
+    const customerBody = `Olá ${order.customer}! Cobrança referente à ${osLabel(order.number)} — ${order.description}: ${formatMoney(order.amount_cents)}, vencimento ${formatDue(dueDate)}.\nPix copia-e-cola:\n${pixBlock.slice('\nPix copia-e-cola:\n'.length)}`;
+    await saveState(tx, operatorId, 'CHARGE_SEND_CONFIRM', {
+      chargeSendTo: to, chargeSendBody: customerBody, chargeSendId: chargeId,
+    }, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `${base}${extra}\nEnviar a cobrança de ${formatMoney(order.amount_cents)} ao cliente ${order.customer} (${formatPhone(contact.phone)})? Responda sim ou não.`,
+      'charge-send-ask');
+    return;
+  }
+  await saveState(tx, operatorId, null, null, null, replyTo);
   await queueReply(tx, operatorId, message.id, replyTo, `${base}${extra}`, 'charge-created');
 }
 
@@ -1456,6 +1558,287 @@ async function handleCpfCommand(
     return;
   }
   await updateCustomerFiscalId(tx, operatorId, sourceMessageId, replyTo, matches[0]!, doc);
+}
+
+// Fase 6.5: dados do tomador/consentimento. O mesmo mecanismo de escolha do
+// CPF é usado para evitar gravar no primeiro resultado ambíguo.
+async function customerMatches(tx: Tx, name: string): Promise<CustomerRow[]> {
+  return tx.$queryRawUnsafe<CustomerRow[]>(
+    'SELECT id, name FROM customers WHERE strpos(normalized_name, $1)>0 ORDER BY created_at, id',
+    normalize(name),
+  );
+}
+
+function formatPhone(phone: string | null): string {
+  if (!phone) return 'sem telefone cadastrado';
+  return `+${phone}`;
+}
+
+function formatAddress(customer: CustomerContactRow): string {
+  if (!customer.address_street || !customer.address_number || !customer.address_district
+    || !customer.address_city || !customer.address_state || !customer.address_zip) return 'não cadastrado';
+  return `${customer.address_street}, ${customer.address_number} — ${customer.address_district}, ${customer.address_city}/${customer.address_state}, CEP ${customer.address_zip}`;
+}
+
+async function applyCustomerUpdate(
+  tx: Tx, message: MessageRow, replyTo: string, customer: CustomerRow,
+  update: NonNullable<ConversationPayload['customerUpdate']>,
+): Promise<void> {
+  if (update.kind === 'PHONE') {
+    await tx.$executeRawUnsafe('UPDATE customers SET phone=$2 WHERE id=$1::uuid', customer.id, update.value);
+    await audit(tx, message.operator_id, message.id, 'customer', customer.id, 'SET_PHONE', null, null);
+    await queueReply(tx, message.operator_id, message.id, replyTo, `Telefone de ${customer.name} atualizado.`, 'customer-phone');
+  } else if (update.kind === 'EMAIL') {
+    await tx.$executeRawUnsafe('UPDATE customers SET email=$2 WHERE id=$1::uuid', customer.id, update.value);
+    await audit(tx, message.operator_id, message.id, 'customer', customer.id, 'SET_EMAIL', null, null);
+    await queueReply(tx, message.operator_id, message.id, replyTo, `E-mail de ${customer.name} atualizado.`, 'customer-email');
+  } else if (update.kind === 'BILLING_OPT_IN') {
+    const allowed = update.value === true;
+    await tx.$executeRawUnsafe('UPDATE customers SET billing_opt_in=$2 WHERE id=$1::uuid', customer.id, allowed);
+    await audit(tx, message.operator_id, message.id, 'customer', customer.id, 'SET_BILLING_OPTIN', null, null);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      allowed
+        ? `Cliente ${customer.name} autorizado a receber cobranças no WhatsApp (${formatPhone((await tx.$queryRawUnsafe<{ phone: string | null }[]>('SELECT phone FROM customers WHERE id=$1::uuid', customer.id))[0]?.phone ?? null)}).`
+        : `Autorização de ${customer.name} revogada.`,
+      allowed ? 'customer-opt-in' : 'customer-opt-out');
+  } else {
+    const address = update.value as CustomerAddress;
+    await tx.$executeRawUnsafe(
+      `UPDATE customers SET address_street=$2, address_number=$3, address_district=$4,
+       address_city=$5, address_state=$6, address_zip=$7 WHERE id=$1::uuid`,
+      customer.id, address.street, address.number, address.district, address.city, address.state, address.zip,
+    );
+    await audit(tx, message.operator_id, message.id, 'customer', customer.id, 'SET_ADDRESS', null, null);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Endereço de ${customer.name} atualizado: ${address.street}, ${address.number} — ${address.district}, ${address.city}/${address.state}, CEP ${address.zip}.`,
+      'customer-address');
+  }
+  await saveState(tx, message.operator_id, null, null, null, replyTo);
+}
+
+async function beginCustomerUpdate(
+  tx: Tx, message: MessageRow, replyTo: string, name: string,
+  update: NonNullable<ConversationPayload['customerUpdate']>,
+): Promise<void> {
+  const matches = await customerMatches(tx, name);
+  if (matches.length === 0) {
+    await queueReply(tx, message.operator_id, message.id, replyTo, `Não encontrei "${name}".`, 'customer-update-missing');
+    return;
+  }
+  if (matches.length === 1) {
+    await applyCustomerUpdate(tx, message, replyTo, matches[0]!, update);
+    return;
+  }
+  await saveState(tx, message.operator_id, 'CUSTOMER_UPDATE_CHOOSE', { candidates: matches, customerUpdate: update }, null, replyTo);
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Encontrei mais de um cliente:\n${matches.map((customer, index) => `${index + 1}. ${customer.name}`).join('\n')}\nResponda com o número.`,
+    'customer-update-many');
+}
+
+async function customerProfile(tx: Tx, message: MessageRow, replyTo: string, name: string): Promise<void> {
+  const matches = await customerMatches(tx, name);
+  if (matches.length === 0) {
+    await queueReply(tx, message.operator_id, message.id, replyTo, `Não encontrei "${name}".`, 'customer-profile-missing');
+    return;
+  }
+  if (matches.length > 1) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Encontrei mais de um cliente:\n${matches.map((customer, index) => `${index + 1}. ${customer.name}`).join('\n')}\nRefine o nome para consultar a ficha.`,
+      'customer-profile-many');
+    return;
+  }
+  const customer = (await tx.$queryRawUnsafe<CustomerContactRow[]>(
+    `SELECT id, name, cpf_cnpj, phone, email, address_street, address_number, address_district,
+            address_city, address_state, address_zip, billing_opt_in
+       FROM customers WHERE id=$1::uuid`, matches[0]!.id,
+  ))[0];
+  if (!customer) throw new Error('CUSTOMER_NOT_FOUND');
+  const totals = (await tx.$queryRawUnsafe<Array<{ orders: bigint; charged: bigint; received: bigint }>>(
+    `SELECT COUNT(so.id) AS orders,
+            COALESCE(SUM(ch.value_cents) FILTER (WHERE ch.status <> 'CANCELED'), 0) AS charged,
+            COALESCE(SUM(ch.paid_value_cents) FILTER (WHERE ch.status='RECEIVED'), 0) AS received
+       FROM service_orders so LEFT JOIN charges ch ON ch.service_order_id=so.id
+      WHERE so.customer_id=$1::uuid`, customer.id,
+  ))[0];
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Cliente: ${customer.name}\nCPF/CNPJ: ${customer.cpf_cnpj ?? 'não cadastrado'}\nTelefone: ${formatPhone(customer.phone)}\nE-mail: ${customer.email ?? 'não cadastrado'}\nEndereço: ${formatAddress(customer)}\nCobranças por WhatsApp: ${customer.billing_opt_in ? 'autorizado' : 'não autorizado'}\nOS: ${totals?.orders ?? 0}\nCobrado: ${formatMoney(Number(totals?.charged ?? 0))}\nRecebido: ${formatMoney(Number(totals?.received ?? 0))}`,
+    'customer-profile');
+}
+
+async function customerHistory(tx: Tx, message: MessageRow, replyTo: string, name: string): Promise<void> {
+  const matches = await customerMatches(tx, name);
+  if (matches.length !== 1) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      matches.length === 0 ? `Não encontrei "${name}".` : 'Encontrei mais de um cliente; refine o nome para consultar o histórico.',
+      'customer-history-match');
+    return;
+  }
+  const customer = matches[0]!;
+  const rows = await tx.$queryRawUnsafe<Array<{ number: number; created_at: Date | string; amount_cents: number | null; status: string; charge_status: string | null }>>(
+    `SELECT so.number, so.created_at, so.amount_cents, so.status,
+            (SELECT ch.status FROM charges ch WHERE ch.service_order_id=so.id ORDER BY ch.created_at DESC LIMIT 1) AS charge_status
+       FROM service_orders so WHERE so.customer_id=$1::uuid ORDER BY so.number DESC LIMIT 5`,
+    customer.id,
+  );
+  const response = rows.length === 0
+    ? `Nenhuma OS para ${customer.name}.`
+    : `Histórico de ${customer.name}:\n${rows.map((row) => {
+      const iso = dueIso(row.created_at);
+      return `${osLabel(row.number)} · ${iso ? formatDue(iso).slice(0, 5) : '—'} · ${formatMoney(row.amount_cents)} · ${row.status} · cobrança ${row.charge_status ?? '—'}`;
+    }).join('\n')}`;
+  await queueReply(tx, message.operator_id, message.id, replyTo, response, 'customer-history');
+}
+
+async function handleCustomerCommand(tx: Tx, message: MessageRow, body: string, replyTo: string): Promise<boolean> {
+  const phone = /^telefone\s+(.+?)\s+(\S+)\s*$/i.exec(body);
+  if (phone) {
+    const value = phone[2]!.replace(/\D/g, '');
+    if (!/^\d{10,13}$/.test(value)) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Telefone inválido. Informe 10 a 13 dígitos com DDI.', 'phone-invalid');
+      return true;
+    }
+    await beginCustomerUpdate(tx, message, replyTo, clean(phone[1]!), { kind: 'PHONE', value });
+    return true;
+  }
+  const email = /^email\s+(.+?)\s+(\S+)\s*$/i.exec(body);
+  if (email) {
+    const value = email[2]!.toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'E-mail inválido.', 'email-invalid');
+      return true;
+    }
+    await beginCustomerUpdate(tx, message, replyTo, clean(email[1]!), { kind: 'EMAIL', value });
+    return true;
+  }
+  const address = /^endere[cç]o\s+(.+?)\s*\|\s*(.+)$/i.exec(body);
+  if (address) {
+    const parts = address[2]!.split(',').map(clean);
+    const cityState = parts.length === 5 ? /^(.+)\/([A-Za-z]{2})$/.exec(parts[3]!) : null;
+    const zip = parts.length === 5 ? parts[4]!.replace(/\D/g, '') : '';
+    if (!cityState || !/^\d{8}$/.test(zip) || parts.some((part) => !part)) {
+      await queueReply(tx, message.operator_id, message.id, replyTo,
+        'Formato: endereco <nome> | <rua>, <número>, <bairro>, <cidade>/<UF>, <CEP>', 'address-invalid');
+      return true;
+    }
+    await beginCustomerUpdate(tx, message, replyTo, clean(address[1]!), {
+      kind: 'ADDRESS',
+      value: { street: parts[0]!, number: parts[1]!, district: parts[2]!, city: clean(cityState[1]!), state: cityState[2]!.toUpperCase(), zip },
+    });
+    return true;
+  }
+  if (/^endere[cç]o\b/i.test(body)) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      'Formato: endereco <nome> | <rua>, <número>, <bairro>, <cidade>/<UF>, <CEP>', 'address-usage');
+    return true;
+  }
+  const optIn = /^(autorizar|revogar)\s+(.+)$/i.exec(body);
+  if (optIn) {
+    await beginCustomerUpdate(tx, message, replyTo, clean(optIn[2]!), { kind: 'BILLING_OPT_IN', value: /^autorizar$/i.test(optIn[1]!) });
+    return true;
+  }
+  const profile = /^cliente\s+(.+)$/i.exec(body);
+  if (profile) {
+    await customerProfile(tx, message, replyTo, clean(profile[1]!));
+    return true;
+  }
+  const history = /^hist[oó]rico\s+(.+)$/i.exec(body);
+  if (history) {
+    await customerHistory(tx, message, replyTo, clean(history[1]!));
+    return true;
+  }
+  return false;
+}
+
+async function executeOrderCancellation(
+  tx: Tx, message: MessageRow, orderId: string, orderNumber: number, replyTo: string,
+): Promise<void> {
+  const orders = await tx.$queryRawUnsafe<CancelOrderRow[]>(
+    `SELECT so.id, so.number, so.status, c.name AS customer, so.amount_cents
+       FROM service_orders so JOIN customers c ON c.id=so.customer_id
+      WHERE so.id=$1::uuid FOR UPDATE`, orderId,
+  );
+  const order = orders[0];
+  if (!order) throw new Error('CANCEL_ORDER_NOT_FOUND');
+  if (order.status === 'CANCELADA') {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo, `A ${osLabel(orderNumber)} já está cancelada.`, 'order-cancelled');
+    return;
+  }
+  const active = await tx.$queryRawUnsafe<Array<{ id: string; status: string }>>(
+    "SELECT id, status FROM charges WHERE service_order_id=$1::uuid AND status IN ('PENDING','OVERDUE') LIMIT 1 FOR UPDATE",
+    order.id,
+  );
+  if (active[0]) {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A ${osLabel(order.number)} tem cobrança ${active[0].status} — cancele a cobrança antes (cancelar cobrança OS ${order.number}).`,
+      'order-cancel-active-charge');
+    return;
+  }
+  const items = order.status === 'CONFIRMADA'
+    ? await tx.$queryRawUnsafe<Array<{ item_id: string; quantity: string }>>(
+      `SELECT soi.inventory_item_id AS item_id, soi.quantity::text AS quantity
+         FROM service_order_items soi JOIN inventory_items ii ON ii.id=soi.inventory_item_id
+        WHERE soi.service_order_id=$1::uuid AND soi.inventory_item_id IS NOT NULL
+        ORDER BY soi.inventory_item_id FOR UPDATE OF ii`, order.id,
+    )
+    : [];
+  const changed = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `UPDATE service_orders SET status='CANCELADA', cancelled_at=now()
+      WHERE id=$1::uuid AND status IN ('AGUARDANDO_DADOS','AGUARDANDO_CONFIRMACAO','CONFIRMADA')
+      RETURNING id`, order.id,
+  );
+  if (!changed[0]) throw new Error('ORDER_CANCEL_STATE_CHANGED');
+  if (order.status === 'CONFIRMADA') {
+    for (const item of items) {
+      await tx.$executeRawUnsafe('UPDATE inventory_items SET quantity=quantity+$2::numeric WHERE id=$1::uuid', item.item_id, item.quantity);
+      await insertMovement(tx, item.item_id, 'RETURN', item.quantity, message.operator_id, message.id, 'cancelamento da OS', order.id);
+    }
+  }
+  await audit(tx, message.operator_id, message.id, 'service_order', order.id, 'CANCEL_ORDER', order.status, 'CANCELADA', 'operador');
+  await saveState(tx, message.operator_id, null, null, null, replyTo);
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    order.status === 'CONFIRMADA' && items.length > 0
+      ? `${osLabel(order.number)} cancelada. ${items.length} item(ns) estornado(s) ao estoque.`
+      : `${osLabel(order.number)} cancelada.`,
+    'order-cancelled');
+}
+
+async function handleOrderLifecycleCommand(tx: Tx, message: MessageRow, body: string, replyTo: string): Promise<boolean> {
+  const parsed = /^cancelar\s+OS\s+(\d+)$/i.exec(body);
+  if (!parsed) return false;
+  const rows = await tx.$queryRawUnsafe<CancelOrderRow[]>(
+    `SELECT so.id, so.number, so.status, c.name AS customer, so.amount_cents
+       FROM service_orders so JOIN customers c ON c.id=so.customer_id WHERE so.number=$1`,
+    Number(parsed[1]),
+  );
+  const order = rows[0];
+  if (!order) {
+    await queueReply(tx, message.operator_id, message.id, replyTo, 'OS não encontrada.', 'order-cancel-missing');
+    return true;
+  }
+  if (order.status === 'CANCELADA') {
+    await queueReply(tx, message.operator_id, message.id, replyTo, `A ${osLabel(order.number)} já está cancelada.`, 'order-cancelled');
+    return true;
+  }
+  const active = await tx.$queryRawUnsafe<Array<{ status: string }>>(
+    "SELECT status FROM charges WHERE service_order_id=$1::uuid AND status IN ('PENDING','OVERDUE') LIMIT 1",
+    order.id,
+  );
+  if (active[0]) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A ${osLabel(order.number)} tem cobrança ${active[0].status} — cancele a cobrança antes (cancelar cobrança OS ${order.number}).`,
+      'order-cancel-active-charge');
+    return true;
+  }
+  const stocked = (await tx.$queryRawUnsafe<Array<{ count: bigint }>>(
+    'SELECT COUNT(*) AS count FROM service_order_items WHERE service_order_id=$1::uuid AND inventory_item_id IS NOT NULL', order.id,
+  ))[0]?.count ?? 0n;
+  await saveState(tx, message.operator_id, 'CANCEL_ORDER_CONFIRM', { cancelOrderId: order.id, cancelOrderNumber: order.number }, null, replyTo);
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Cancelar a ${osLabel(order.number)} (${order.customer}, ${formatMoney(order.amount_cents)}, status ${order.status})?${order.status === 'CONFIRMADA' && stocked > 0n ? ' Materiais serão estornados ao estoque.' : ''} Responda sim ou cancelar.`,
+    'order-cancel-confirm');
+  return true;
 }
 
 // Comandos de cobrança sem pendência ativa (!hasState).
@@ -1619,6 +2002,38 @@ async function handleBillingCommand(
 async function handleBillingStep(
   tx: Tx, message: MessageRow, payload: ConversationPayload, body: string, replyTo: string, cfg: Config,
 ): Promise<boolean> {
+  if (message.pending_action === 'CUSTOMER_UPDATE_CHOOSE') {
+    const choice = Number(body);
+    const candidate = Number.isInteger(choice) ? payload.candidates?.[choice - 1] : undefined;
+    if (!candidate || !payload.customerUpdate) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Escolha um número da lista.', 'choose-invalid');
+      return true;
+    }
+    await applyCustomerUpdate(tx, message, replyTo, candidate, payload.customerUpdate);
+    return true;
+  }
+  if (message.pending_action === 'CHARGE_SEND_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Ok, cobrança só com você.', 'charge-send-skip');
+      return true;
+    }
+    if (!payload.chargeSendTo || !payload.chargeSendBody || !payload.chargeSendId) throw new Error('CHARGE_SEND_FIELDS_MISSING');
+    await queueNotice(tx, message.operator_id, payload.chargeSendTo, payload.chargeSendBody, `charge-send:${payload.chargeSendId}`);
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo, 'Cobrança enviada ao cliente.', 'charge-send-confirmed');
+    return true;
+  }
+  if (message.pending_action === 'CANCEL_ORDER_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Operação cancelada.', 'order-cancel-abort');
+      return true;
+    }
+    if (!payload.cancelOrderId || !payload.cancelOrderNumber) throw new Error('CANCEL_ORDER_FIELDS_MISSING');
+    await executeOrderCancellation(tx, message, payload.cancelOrderId, payload.cancelOrderNumber, replyTo);
+    return true;
+  }
   if (message.pending_action === 'CPF_CHOOSE') {
     const choice = Number(body);
     const candidate = Number.isInteger(choice) ? payload.candidates?.[choice - 1] : undefined;
@@ -1736,6 +2151,8 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
     await handleStockCommand(tx, message, body, replyTo);
     return;
   }
+  if (!hasState && await handleCustomerCommand(tx, message, body, replyTo)) return;
+  if (!hasState && await handleOrderLifecycleCommand(tx, message, body, replyTo)) return;
   if (!hasState && /^(cobrar|cobran[çc]as|vencidas|recebi|cancelar\s+cobran[çc]a|cpf)\b/i.test(body)) {
     await handleBillingCommand(tx, message, body, replyTo, cfg);
     return;
