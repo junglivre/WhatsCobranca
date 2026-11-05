@@ -25,4 +25,5 @@
 
 ## Verificação
 
-- `npx tsc --noEmit` OK; `npm run verify` (52 cenários) e smoke real pendentes do deploy.
+- `npm run verify`: 52 cenários PASS + VERIFY PASS (commit 94a5198).
+- Smoke real (WhatsApp, produção): `emitir NF OS 4 1.02` → confirmação → `NEEDS_REVIEW` com referência `OS-4-NF1`; `notas` lista `OS 000004 · NEEDS_REVIEW · manual`; banco confirma payload (20000 cents) e auditoria `REQUEST_INVOICE`.
