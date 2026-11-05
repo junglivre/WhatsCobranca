@@ -4,6 +4,7 @@ import { formatMoney, formatQty, isNo, isYes, normalize, osLabel, parseMoney, pa
 import { downloadWahaMedia, MediaFailure } from './waha.js';
 import { extractServiceIntent, GroqFailure, transcribeAudio, type Extraction } from './groq.js';
 import { getBillingProvider } from './providers/registry.js';
+import { MissingFiscalIdError } from './providers/billing/types.js';
 import type { CreatedCharge } from './providers/billing/types.js';
 
 type Purpose = 'CREATE' | 'QUERY' | 'MATERIAL';
@@ -69,6 +70,9 @@ type ConversationPayload = {
   chargeDbId?: string;
   receiptCents?: number;
   receiptMethod?: 'CASH' | 'EXTERNAL_PIX';
+  // Comando `cpf <nome> <documento>` com nome ambíguo: o documento já
+  // validado viaja no payload enquanto o operador escolhe o cliente.
+  cpfDoc?: string;
 };
 
 const thirtyMinutes = () => new Date(Date.now() + 30 * 60 * 1000);
@@ -150,6 +154,7 @@ function payloadOf(value: unknown): ConversationPayload {
     chargeDbId: typeof record.chargeDbId === 'string' && record.chargeDbId.length > 0 ? record.chargeDbId : undefined,
     receiptCents: positiveCents(record.receiptCents),
     receiptMethod: record.receiptMethod === 'CASH' || record.receiptMethod === 'EXTERNAL_PIX' ? record.receiptMethod : undefined,
+    cpfDoc: typeof record.cpfDoc === 'string' && /^\d{11}(?:\d{3})?$/.test(record.cpfDoc) ? record.cpfDoc : undefined,
   };
 }
 
@@ -1082,6 +1087,7 @@ type ChargeOrderRow = {
   due_date: Date | string | null;
   customer_id: string;
   customer: string;
+  customer_cpf_cnpj: string | null;
   description: string;
 };
 type ChargeRow = {
@@ -1125,7 +1131,7 @@ function parseDueInput(input: string): string | null {
 
 async function findOrderForCharge(tx: Tx, osNumber: number): Promise<ChargeOrderRow | undefined> {
   const orders = await tx.$queryRawUnsafe<ChargeOrderRow[]>(
-    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer, c.cpf_cnpj AS customer_cpf_cnpj
        FROM service_orders AS so JOIN customers AS c ON c.id=so.customer_id
       WHERE so.number=$1`,
     osNumber,
@@ -1197,7 +1203,7 @@ async function executeChargeCreation(
   if (!orderId || !method || !dueDate) throw new Error('CHARGE_FIELDS_MISSING');
   // Revalidação no 'sim': a OS pode ter mudado durante a conversa guiada.
   const order = await tx.$queryRawUnsafe<ChargeOrderRow[]>(
-    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer, c.cpf_cnpj AS customer_cpf_cnpj
        FROM service_orders AS so JOIN customers AS c ON c.id=so.customer_id WHERE so.id=$1::uuid`,
     orderId,
   ).then((rows) => rows[0]);
@@ -1231,6 +1237,7 @@ async function executeChargeCreation(
 
   let created: CreatedCharge | null = null;
   let failureName = 'erro';
+  let fiscalIdMissing = false;
   try {
     const refs = await tx.$queryRawUnsafe<Array<{ external_id: string }>>(
       'SELECT external_id FROM customer_provider_refs WHERE customer_id=$1::uuid AND provider=$2',
@@ -1245,6 +1252,13 @@ async function executeChargeCreation(
         order.customer_id, provider.name, externalId,
       );
     }
+    // O Asaas rejeita cobrança de cliente sem CPF/CNPJ: sincroniza o
+    // documento (idempotente) ANTES de criar a cobrança.
+    if (order.customer_cpf_cnpj) {
+      await provider.updateCustomer(externalId, {
+        customerId: order.customer_id, name: order.customer, cpfCnpj: order.customer_cpf_cnpj,
+      });
+    }
     created = await provider.createCharge({
       providerCustomerId: externalId,
       method,
@@ -1254,7 +1268,19 @@ async function executeChargeCreation(
       externalReference,
     });
   } catch (error) {
-    failureName = error instanceof Error && error.name === 'ProviderTimeoutError' ? 'timeout' : 'erro';
+    fiscalIdMissing = error instanceof MissingFiscalIdError;
+    failureName = fiscalIdMissing ? 'CPF/CNPJ ausente'
+      : error instanceof Error && error.name === 'ProviderTimeoutError' ? 'timeout' : 'erro';
+  }
+  if (!created && fiscalIdMissing) {
+    // Rejeição determinística do provedor: nada foi criado lá — reconciliar
+    // ou reenviar sem o documento não resolve. Orienta o comando `cpf`.
+    await tx.$executeRawUnsafe("UPDATE charges SET status='ERROR', updated_at=now() WHERE id=$1::uuid", chargeId);
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `O provedor exige o CPF/CNPJ do cliente para cobrar. Informe com: cpf ${order.customer} <número> e tente novamente.`,
+      'charge-fiscal-id');
+    return;
   }
   if (!created) {
     // Timeout/5xx: NUNCA presumir falha — consultar o provedor pela referência
@@ -1375,12 +1401,69 @@ async function executeChargeCancel(
     `Cobrança da ${osLabel(charge.number)} cancelada.`, 'charge-canceled');
 }
 
+// `cpf <nome> <documento>`: grava o CPF/CNPJ do cliente (o Asaas exige o
+// documento do pagador para criar cobrança). Documento: 11 (CPF) ou 14
+// (CNPJ) dígitos após remover pontuação — dígito verificador NÃO é validado
+// nesta fase. Nome ambíguo → lista numerada (estado CPF_CHOOSE).
+async function updateCustomerFiscalId(
+  tx: Tx, operatorId: string, sourceMessageId: string, replyTo: string,
+  customer: CustomerRow, doc: string,
+): Promise<void> {
+  await tx.$executeRawUnsafe('UPDATE customers SET cpf_cnpj=$2 WHERE id=$1::uuid', customer.id, doc);
+  await audit(tx, operatorId, sourceMessageId, 'customer', customer.id, 'SET_CPF_CNPJ', null, null);
+  await saveState(tx, operatorId, null, null, null, replyTo);
+  await queueReply(tx, operatorId, sourceMessageId, replyTo,
+    `CPF/CNPJ de ${customer.name} atualizado. Tente a cobrança novamente.`, 'cpf-updated');
+}
+
+async function handleCpfCommand(
+  tx: Tx, message: MessageRow, body: string, replyTo: string,
+): Promise<void> {
+  const operatorId = message.operator_id;
+  const sourceMessageId = message.id;
+  const parsed = /^cpf\s+(.+?)\s+(\S+)\s*$/i.exec(body);
+  if (!parsed) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      'Use: cpf <nome do cliente> <documento>. Ex.: cpf Carlos 529.982.247-25.', 'cpf-usage');
+    return;
+  }
+  const name = clean(parsed[1]!);
+  const doc = parsed[2]!.replace(/\D/g, '');
+  if (!/^\d{11}(?:\d{3})?$/.test(doc)) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      'Documento inválido. Informe CPF (11 dígitos) ou CNPJ (14 dígitos), com ou sem pontuação.', 'cpf-invalid');
+    return;
+  }
+  const matches = await tx.$queryRawUnsafe<CustomerRow[]>(
+    'SELECT id, name FROM customers WHERE strpos(normalized_name, $1)>0 ORDER BY created_at, id',
+    normalize(name),
+  );
+  if (matches.length === 0) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `Não encontrei cliente com esse nome: ${name}.`, 'cpf-customer-missing');
+    return;
+  }
+  if (matches.length > 1) {
+    await saveState(tx, operatorId, 'CPF_CHOOSE', { candidates: matches, cpfDoc: doc }, null, replyTo);
+    const choices = matches.map((customer, index) => `${index + 1}. ${customer.name}`).join('\n');
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `Encontrei mais de um cliente:\n${choices}\nResponda com o número.`, 'cpf-customer-many');
+    return;
+  }
+  await updateCustomerFiscalId(tx, operatorId, sourceMessageId, replyTo, matches[0]!, doc);
+}
+
 // Comandos de cobrança sem pendência ativa (!hasState).
 async function handleBillingCommand(
   tx: Tx, message: MessageRow, body: string, replyTo: string, cfg: Config,
 ): Promise<void> {
   const operatorId = message.operator_id;
   const sourceMessageId = message.id;
+
+  if (/^cpf\b/i.test(body)) {
+    await handleCpfCommand(tx, message, body, replyTo);
+    return;
+  }
 
   if (/^cobran[çc]as$/i.test(body)) {
     const rows = await tx.$queryRawUnsafe<Array<{ number: number; customer: string; value_cents: number; due_date: Date | string | null; status: string }>>(
@@ -1531,6 +1614,16 @@ async function handleBillingCommand(
 async function handleBillingStep(
   tx: Tx, message: MessageRow, payload: ConversationPayload, body: string, replyTo: string, cfg: Config,
 ): Promise<boolean> {
+  if (message.pending_action === 'CPF_CHOOSE') {
+    const choice = Number(body);
+    const candidate = Number.isInteger(choice) ? payload.candidates?.[choice - 1] : undefined;
+    if (!candidate || !payload.cpfDoc) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Escolha um número da lista.', 'choose-invalid');
+      return true;
+    }
+    await updateCustomerFiscalId(tx, message.operator_id, message.id, replyTo, candidate, payload.cpfDoc);
+    return true;
+  }
   if (message.pending_action === 'CHARGE_METHOD') {
     const method = /^pix$/i.test(body) ? 'PIX' as const : /^boleto$/i.test(body) ? 'BOLETO' as const : null;
     if (!method) {
@@ -1638,7 +1731,7 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
     await handleStockCommand(tx, message, body, replyTo);
     return;
   }
-  if (!hasState && /^(cobrar|cobran[çc]as|vencidas|recebi|cancelar\s+cobran[çc]a)\b/i.test(body)) {
+  if (!hasState && /^(cobrar|cobran[çc]as|vencidas|recebi|cancelar\s+cobran[çc]a|cpf)\b/i.test(body)) {
     await handleBillingCommand(tx, message, body, replyTo, cfg);
     return;
   }

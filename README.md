@@ -157,6 +157,7 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 - `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
 - `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
+- `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas **exige** CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
 
 **Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
 

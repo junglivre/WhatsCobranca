@@ -431,7 +431,7 @@ const groqLedger = async () => groqControl('/ledger') as Promise<GroqLedger>;
 // 500, simulando timeout/resposta perdida para testar a reconciliação).
 const ASAAS_TEST_KEY = 'integration-asaas-key';
 const ASAAS_TEST_WEBHOOK_TOKEN = 'integration-asaas-webhook-token';
-type AsaasCustomer = { id: string; name: string; externalReference: string };
+type AsaasCustomer = { id: string; name: string; externalReference: string; cpfCnpj?: string };
 type AsaasPayment = {
   id: string; customer: string; billingType: string; value: number;
   dueDate: string; description: string; externalReference: string; status: string; deleted: boolean;
@@ -441,12 +441,16 @@ const asaasCustomers: AsaasCustomer[] = [];
 const asaasPayments: AsaasPayment[] = [];
 const asaasCalls: AsaasCall[] = [];
 let asaasCreateThen500 = false;
+// Quando ligado, POST /payments reproduz a rejeição real do sandbox Asaas
+// para cliente sem CPF/CNPJ (invalid_object "CPF ou CNPJ do cliente").
+let asaasRequireFiscalId = false;
 let asaasSeq = 0;
 function asaasReset() {
   asaasCustomers.length = 0;
   asaasPayments.length = 0;
   asaasCalls.length = 0;
   asaasCreateThen500 = false;
+  asaasRequireFiscalId = false;
   asaasSeq = 0;
 }
 const asaasReply = (response: http.ServerResponse, status: number, body: unknown) => {
@@ -477,13 +481,33 @@ const asaasFake = http.createServer((request, response) => {
       return asaasReply(response, 200, { object: 'list', data: asaasCustomers.filter((customer) => customer.externalReference === externalReference) });
     }
     if (request.method === 'POST' && path === '/customers') {
-      const input = body as { name: string; externalReference: string };
-      const customer: AsaasCustomer = { id: `cus_test_${++asaasSeq}`, name: input.name, externalReference: input.externalReference };
+      const input = body as { name: string; externalReference: string; cpfCnpj?: string };
+      const customer: AsaasCustomer = {
+        id: `cus_test_${++asaasSeq}`, name: input.name, externalReference: input.externalReference,
+        ...(input.cpfCnpj ? { cpfCnpj: input.cpfCnpj } : {}),
+      };
       asaasCustomers.push(customer);
+      return asaasReply(response, 200, { object: 'customer', ...customer });
+    }
+    const customerMatch = /^\/customers\/([^/]+)$/.exec(path);
+    if (request.method === 'PUT' && customerMatch) {
+      const customer = asaasCustomers.find((candidate) => candidate.id === customerMatch[1]);
+      if (!customer) return asaasReply(response, 404, { errors: [{ description: 'not found' }] });
+      const input = body as { name?: string; cpfCnpj?: string; email?: string; mobilePhone?: string };
+      if (input.name) customer.name = input.name;
+      if (input.cpfCnpj) customer.cpfCnpj = input.cpfCnpj;
       return asaasReply(response, 200, { object: 'customer', ...customer });
     }
     if (request.method === 'POST' && path === '/payments') {
       const input = body as { customer: string; billingType: string; value: number; dueDate: string; description: string; externalReference: string };
+      if (asaasRequireFiscalId) {
+        const customer = asaasCustomers.find((candidate) => candidate.id === input.customer);
+        if (!customer?.cpfCnpj) {
+          return asaasReply(response, 400, {
+            errors: [{ code: 'invalid_object', description: 'Para criar esta cobrança é necessário preencher o CPF ou CNPJ do cliente.' }],
+          });
+        }
+      }
       const payment: AsaasPayment = {
         id: `pay_test_${++asaasSeq}`, customer: input.customer, billingType: input.billingType,
         value: input.value, dueDate: input.dueDate, description: input.description,
@@ -2165,6 +2189,77 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(charge.pix_qr_url, null);
     assert.equal(asaasPayments[0]!.billingType, 'BOLETO');
     assert.equal(asaasCallsTo('GET', `/payments/${charge.provider_charge_id}/pixQrCode`).length, 0, 'boleto não busca pix');
+  }],
+  ['cobrar sem CPF/CNPJ recebe orientação determinística; após comando cpf a cobrança é criada', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico fiscal', 'Cliente Fiscal', '150');
+    asaasRequireFiscalId = true; // reproduz a rejeição real do sandbox Asaas
+    const summary = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    assert.match(summary.text, /Confirma\?/);
+    const failed = await inbound('sim');
+    await pending(null);
+    assert.match(failed.text, /O provedor exige o CPF\/CNPJ do cliente para cobrar\. Informe com: cpf Cliente Fiscal <número> e tente novamente\./);
+    const rejected = (await charges())[0]!;
+    assert.equal(rejected.status, 'ERROR');
+    assert.equal(rejected.external_reference, 'OS-1-C1');
+    assert.equal(rejected.provider_charge_id, null);
+    assert.equal(asaasPayments.length, 0, 'rejeição determinística não cria cobrança no provedor');
+    // Comando cpf: grava o documento e audita.
+    const cpfReply = await inbound('cpf Cliente Fiscal 529.982.247-25');
+    assert.match(cpfReply.text, /CPF\/CNPJ de Cliente Fiscal atualizado\. Tente a cobrança novamente\./);
+    const [customerRow] = await prisma.$queryRawUnsafe<Array<{ cpf_cnpj: string | null }>>(
+      "SELECT cpf_cnpj FROM customers WHERE name='Cliente Fiscal'",
+    );
+    assert.equal(customerRow!.cpf_cnpj, '52998224725', 'documento gravado sem pontuação');
+    assert.deepEqual((await audits(cpfReply.id)).map((entry) => [entry.entity_type, entry.action]), [['customer', 'SET_CPF_CNPJ']]);
+    // Retry: updateCustomer (PUT) sincroniza o documento e a cobrança é criada.
+    const retry = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    assert.match(retry.text, /Confirma\?/);
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Cobrança criada: OS 000001/);
+    assert.match(done.text, /Pix copia-e-cola/);
+    const rows = await charges();
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1]!.status, 'PENDING');
+    assert.equal(rows[1]!.external_reference, 'OS-1-C2');
+    assert.equal(asaasCallsTo('PUT', '/customers/').length, 1, 'documento sincronizado via PUT');
+    assert.equal(asaasCustomers[0]!.cpfCnpj, '52998224725');
+    assert.equal(asaasCallsTo('POST', '/payments').length, 2, 'uma rejeição + uma criação');
+    assert.equal(asaasPayments.length, 1);
+    assert.equal(asaasCallsTo('POST', '/customers').length, 1, 'cliente reusa a referência persistida');
+  }],
+  ['cpf com nome ambíguo lista opções; documento inválido é rejeitado determinísticamente', async () => {
+    await seedCustomer('Cliente Ambíguo Um');
+    await seedCustomer('Cliente Ambíguo Dois');
+    const ambiguous = await inbound('cpf Cliente Ambíguo 12.345.678/0001-95');
+    assert.match(ambiguous.text, /Encontrei mais de um cliente:\n1\. Cliente Ambíguo Um\n2\. Cliente Ambíguo Dois\nResponda com o número\./);
+    await pending('CPF_CHOOSE');
+    const chosen = await inbound('2');
+    await pending(null);
+    assert.match(chosen.text, /CPF\/CNPJ de Cliente Ambíguo Dois atualizado\. Tente a cobrança novamente\./);
+    const docs = await prisma.$queryRawUnsafe<Array<{ name: string; cpf_cnpj: string | null }>>(
+      'SELECT name, cpf_cnpj FROM customers ORDER BY created_at, id',
+    );
+    assert.deepEqual(docs, [
+      { name: 'Cliente Ambíguo Um', cpf_cnpj: null },
+      { name: 'Cliente Ambíguo Dois', cpf_cnpj: '12345678000195' },
+    ]);
+    assert.deepEqual((await audits(chosen.id)).map((entry) => [entry.entity_type, entry.action]), [['customer', 'SET_CPF_CNPJ']]);
+    // Documento inválido: rejeição determinística, nada gravado, sem pendência.
+    for (const invalid of ['cpf Cliente Ambíguo Um 123', 'cpf Cliente Ambíguo Um 5299822472', 'cpf Cliente Ambíguo Um 1234567800019A', 'cpf Cliente Ambíguo Um 123456789012345']) {
+      const rejected = await inbound(invalid);
+      assert.match(rejected.text, /Documento inválido\. Informe CPF \(11 dígitos\) ou CNPJ \(14 dígitos\)/);
+      await pending(null);
+    }
+    const after = await prisma.$queryRawUnsafe<Array<{ cpf_cnpj: string | null }>>(
+      "SELECT cpf_cnpj FROM customers WHERE name='Cliente Ambíguo Um'",
+    );
+    assert.equal(after[0]!.cpf_cnpj, null);
+    // Nome sem match e uso incorreto: respostas determinísticas.
+    assert.match((await inbound('cpf Ninguem Aqui 52998224725')).text, /Não encontrei cliente com esse nome: Ninguem Aqui\./);
+    assert.match((await inbound('cpf')).text, /Use: cpf <nome do cliente> <documento>/);
+    await pending(null);
   }],
 ];
 

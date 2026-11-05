@@ -19,6 +19,9 @@ export class ManualBillingProvider implements BillingProvider {
     return `manual-${input.customerId}`;
   }
 
+  /** Sem provedor externo, não há cadastro a atualizar: no-op. */
+  async updateCustomer(_externalId: string, _input: ChargeCustomerInput): Promise<void> {}
+
   /** O pagamento externo já aconteceu — nasce RECEIVED. */
   async createCharge(input: CreateChargeInput): Promise<CreatedCharge> {
     void input;

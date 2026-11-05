@@ -8,6 +8,7 @@
 - Webhook `/webhooks/billing/:provider`: token, 200 rápido, dedup por `(provider, provider_event_id)`, processamento FIFO no tick; sweep diário de vencidas; notificações ao operador com dedup por transição. `RECEIVED` nunca é rebaixado; só `RECEIVED` conta como dinheiro.
 - Intenção `DRAFT` persistida antes de qualquer chamada ao provedor; erro nunca é presumido sem reconciliar.
 - 12 cenários novos (48 no total).
+- Pós-smoke sandbox: `customers.cpf_cnpj` + comando `cpf <nome> <documento>` — o Asaas exige CPF/CNPJ do cliente para cobrar; `updateCustomer` na porta sincroniza antes de criar; erro de fiscal-id vira orientação determinística (50 cenários).
 
 ## 0.3.0 — Fase 5: Estoque/materiais
 

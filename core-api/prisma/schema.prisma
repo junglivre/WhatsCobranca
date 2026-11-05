@@ -27,6 +27,7 @@ model Customer {
   id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   name String
   normalizedName String @map("normalized_name")
+  cpfCnpj String? @map("cpf_cnpj")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   orders ServiceOrder[]
   providerRefs CustomerProviderRef[]

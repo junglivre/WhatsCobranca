@@ -88,12 +88,32 @@ export class ProviderTimeoutError extends Error {
   }
 }
 
+/**
+ * O provedor rejeitou a operação porque o cliente não tem CPF/CNPJ
+ * cadastrado (ex.: Asaas exige o documento do pagador para criar cobrança).
+ * Erro DETERMINÍSTICO: não adianta reconciliar nem reenviar sem antes
+ * atualizar o cadastro do cliente (comando `cpf <nome> <documento>`).
+ */
+export class MissingFiscalIdError extends Error {
+  constructor(message = 'provider requires customer CPF/CNPJ') {
+    super(message);
+    this.name = 'MissingFiscalIdError';
+  }
+}
+
 export interface BillingProvider {
   /** Chave do adapter — gravada em charges.provider. Ex.: 'asaas', 'manual'. */
   readonly name: string;
 
   /** Garante o cliente no provedor; retorna o external_id (idempotente). */
   ensureCustomer(input: ChargeCustomerInput): Promise<string>;
+
+  /**
+   * Atualiza o cadastro do cliente no provedor (idempotente). Chamado antes
+   * de createCharge quando o domínio tem dados novos (ex.: cpfCnpj) — o
+   * Asaas rejeita cobrança de cliente sem CPF/CNPJ.
+   */
+  updateCustomer(externalId: string, input: ChargeCustomerInput): Promise<void>;
 
   createCharge(input: CreateChargeInput): Promise<CreatedCharge>;
 

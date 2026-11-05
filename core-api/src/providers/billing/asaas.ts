@@ -30,7 +30,7 @@ import type {
   BillingProvider, ChargeCustomerInput, ChargeStatus, CreateChargeInput,
   CreatedCharge, NormalizedBillingEvent, PixData, ProviderChargeSnapshot,
 } from './types.js';
-import { ProviderTimeoutError, WebhookAuthError } from './types.js';
+import { MissingFiscalIdError, ProviderTimeoutError, WebhookAuthError } from './types.js';
 import type { BillingEventType } from './types.js';
 
 const TIMEOUT_MS = 10_000;
@@ -75,6 +75,12 @@ export class AsaasBillingProvider implements BillingProvider {
     const text = await response.text();
     if (response.status < 200 || response.status >= 300) {
       // NUNCA incluir headers nem credenciais no erro — só status e corpo truncado.
+      if (text.includes('CPF ou CNPJ')) {
+        // Rejeição determinística (ex.: criar cobrança de cliente sem
+        // documento): o domínio orienta o comando `cpf` — reconciliar ou
+        // reenviar sem atualizar o cadastro não resolve.
+        throw new MissingFiscalIdError(`asaas ${method} ${path}: HTTP ${response.status}: ${text.slice(0, 200)}`);
+      }
       throw new Error(`asaas ${method} ${path} failed: HTTP ${response.status}: ${text.slice(0, 200)}`);
     }
     return (text ? JSON.parse(text) : {}) as T;
@@ -95,6 +101,16 @@ export class AsaasBillingProvider implements BillingProvider {
       ...(input.phone ? { mobilePhone: input.phone } : {}),
     });
     return created.id;
+  }
+
+  /** PUT /customers/{id}: só envia os campos presentes (idempotente). */
+  async updateCustomer(externalId: string, input: ChargeCustomerInput): Promise<void> {
+    await this.request('PUT', `/customers/${encodeURIComponent(externalId)}`, {
+      name: input.name,
+      ...(input.cpfCnpj ? { cpfCnpj: input.cpfCnpj } : {}),
+      ...(input.email ? { email: input.email } : {}),
+      ...(input.phone ? { mobilePhone: input.phone } : {}),
+    });
   }
 
   async createCharge(input: CreateChargeInput): Promise<CreatedCharge> {
