@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — Fase 7: Fluxo fiscal plugável
+
+- Porta `InvoiceProvider` virou fluxo de conversa determinístico: `emitir NF OS <n> <código-do-serviço>` (resumo → confirmação → solicitação) e `notas` (pendências).
+- Intenção persistida antes de falar com o emissor (`READY_FOR_APPROVAL` + `externalReference` = `OS-<n>-NF<seq>`); a porta ganha `findByExternalReference` — falha nunca presume perda: sem confirmação, a solicitação fica `NEEDS_REVIEW` com `last_error`.
+- Adapter `manual` (referência): toda solicitação → `NEEDS_REVIEW` para emissão humana no Portal Nacional; `INVOICE_PROVIDER=none` responde determinístico sem criar nada.
+- Regras: só OS `CONFIRMADA` com valor; CPF/CNPJ do tomador obrigatório (orienta `cpf`); dedup de solicitação ativa por OS/provedor; auditoria `REQUEST_INVOICE`.
+- Sem migração de banco — `invoices` já comportava o fluxo. 2 cenários novos (52 no total). Smoke real: OS 4 → `NEEDS_REVIEW` ref. `OS-4-NF1`, auditoria e `notas` conferidas.
+
 ## 0.4.1 — Cadastro financeiro e cancelamento de OS
 
 - Clientes passam a guardar telefone, e-mail, endereço e consentimento financeiro explícito. Comandos: `telefone`, `email`, `endereco`, `autorizar`, `revogar`, `cliente` e `histórico`.
