@@ -15,7 +15,7 @@ WhatsApp → WAHA → webhook assinado (HMAC-SHA512) → inbox PostgreSQL
                                            outbox PostgreSQL → WAHA → WhatsApp
 ```
 
-Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico e, desde a Fase 4, notas de voz transcritas e interpretadas por IA (ver [Áudio (Fase 4)](#áudio-fase-4)). **Fora de escopo:** controle de estoque, cobrança (Asaas) e emissão fiscal — a gramática de TEXTO continua 100% determinística; IA só entra no fluxo de áudio.
+Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico, estoque, cobrança por adapters e, desde a Fase 4, notas de voz transcritas e interpretadas por IA (ver [Áudio (Fase 4)](#áudio-fase-4)). A emissão fiscal tem porta e persistência, mas ainda não tem fluxo conversacional. A gramática de TEXTO continua 100% determinística; IA só entra no fluxo de áudio.
 
 ## Por que a conversa (de texto) não usa IA
 
@@ -125,7 +125,7 @@ Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`)
 
 **Privacidade:** nenhum byte de áudio é persistido nem vai para disco local — só o texto da transcrição fica no banco (coluna `messages.transcription`). O servidor Groq recebe os bytes por HTTPS e é tratado como processador externo; para instalações sem Groq, o áudio é simplesmente rejeitado sem sair da rede local.
 
-**Limitação conhecida (POC):** OS em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO` que o operador nunca confirma (ou abandona ao iniciar outro atendimento por áudio) ficam abertas no banco — não há comando para cancelar OS por número nem retomar rascunho nesta fase. Elas aparecem nas consultas; cancelamento dirigido por número fica para o próximo ciclo.
+**Limitação conhecida (POC):** o comando `cancelar OS <n>` cobre rascunhos e OS confirmadas, mas não há comando para retomar um rascunho abandonado; inicie um novo atendimento se precisar refazê-lo.
 
 ## Estoque (Fase 5)
 
@@ -137,7 +137,7 @@ Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`
 
 **Regras:** sem saldo negativo (confirmação bloqueada com mensagem determinística — dê entrada e confirme de novo); baixa idempotente (re-confirmação nunca duplica movement); itens imutáveis após confirmar; `corrigir materiais` reabre a lista apagando os itens do rascunho. Nota de voz também preenche materiais quando o LLM extrai a lista (material ambíguo/inexistente fica pendente, nunca criado automaticamente).
 
-**Limitação:** custo médio do material não é calculado nesta fase (sem campo nem fluxo); cancelamento dirigido de OS por número segue pendente.
+**Limitação:** custo médio do material não é calculado nesta fase (sem campo nem fluxo).
 
 ## Financeiro e integrações plugáveis (Fase 6)
 
