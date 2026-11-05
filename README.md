@@ -139,6 +139,31 @@ Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`
 
 **Limitação:** custo médio do material não é calculado nesta fase (sem campo nem fluxo); cancelamento dirigido de OS por número segue pendente.
 
+## Financeiro e integrações plugáveis (Fase 6)
+
+**O sistema não é "Asaas-only".** O domínio só conhece duas portas (interfaces TypeScript) — provedores são adapters trocáveis por configuração:
+
+| Porta | Interface | Adapters atuais | Futuros sem refactor |
+|---|---|---|---|
+| Cobrança | `core-api/src/providers/billing/types.ts` (`BillingProvider`) | `asaas`, `manual` | Gerencianet, Mercado Pago, PIX direto via PSP… |
+| NFS-e | `core-api/src/providers/invoices/types.ts` (`InvoiceProvider`) | `manual` (pendência p/ emissão humana) | `asaas` (Fase 7), **Portal Nacional direto** (sem terceiro) |
+
+Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|manual`. Registry em `core-api/src/providers/registry.ts`.
+
+**Para plugar um provedor novo:** implemente a interface da porta (o adapter `manual` é a referência mínima), registre no `registry.ts` e no enum do `config.ts`, e adicione cenários de integração com um fake HTTP do provedor. Regras invioláveis: status do provedor NUNCA são persistidos crus (o adapter traduz para o vocabulário interno); a intenção (linha `DRAFT` + `external_reference`) é persistida ANTES da chamada; após timeout/5xx, reconciliar via `findByExternalReference` antes de reenviar — nunca presumir falha.
+
+**Comandos do operador:**
+- `cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]` — guiado quando incompleto; resumo → confirmação → cobrança criada; Pix devolve o **copia-e-cola** na resposta.
+- `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
+- `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
+- `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
+
+**Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
+
+**Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador). A notificação ao cliente final NÃO é automática (sem consentimento/frequência configurados).
+
+**Limitações desta fase:** envio da cobrança ao cliente final não existe (cadastro ainda não tem telefone/opt-in — o copia-e-cola vai para o operador repassar); boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); NFS-e tem porta+tabela mas nenhum fluxo de conversa (Fase 7); custo médio de material segue fora.
+
 ## Verificação isolada
 
 ```sh

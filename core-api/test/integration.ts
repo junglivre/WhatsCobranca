@@ -288,12 +288,13 @@ async function beginOrderToMaterials(description: string, customerName: string, 
 }
 async function reset() {
   // Only the disposable *_test database supplied by verify.sh can reach this operation.
-  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, service_orders, inventory_items, customers');
+  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, billing_events, charges, invoices, customer_provider_refs, service_orders, inventory_items, customers');
   await prisma.$executeRawUnsafe('ALTER SEQUENCE service_order_number_seq RESTART WITH 1');
   deliveries.length = 0;
   providerAttempts.length = 0;
   deliveryMode = 'accept';
   mediaDownloads.length = 0;
+  asaasReset();
 }
 
 // ---------------------------------------------------------------------------
@@ -423,11 +424,135 @@ async function groqControl(path: string, body?: unknown): Promise<unknown> {
 }
 const groqReset = async () => groqControl('/reset', {});
 const groqLedger = async () => groqControl('/ledger') as Promise<GroqLedger>;
+// ---------------------------------------------------------------------------
+// Asaas fake (Fase 6): espelha a API v3 usada pelo adapter — clientes,
+// cobranças, pixQrCode e cancelamento — com ledger de chamadas para asserts
+// e modo de falha injetável (create-then-500: grava a cobrança mas responde
+// 500, simulando timeout/resposta perdida para testar a reconciliação).
+const ASAAS_TEST_KEY = 'integration-asaas-key';
+const ASAAS_TEST_WEBHOOK_TOKEN = 'integration-asaas-webhook-token';
+type AsaasCustomer = { id: string; name: string; externalReference: string };
+type AsaasPayment = {
+  id: string; customer: string; billingType: string; value: number;
+  dueDate: string; description: string; externalReference: string; status: string; deleted: boolean;
+};
+type AsaasCall = { method: string; path: string; body: unknown };
+const asaasCustomers: AsaasCustomer[] = [];
+const asaasPayments: AsaasPayment[] = [];
+const asaasCalls: AsaasCall[] = [];
+let asaasCreateThen500 = false;
+let asaasSeq = 0;
+function asaasReset() {
+  asaasCustomers.length = 0;
+  asaasPayments.length = 0;
+  asaasCalls.length = 0;
+  asaasCreateThen500 = false;
+  asaasSeq = 0;
+}
+const asaasReply = (response: http.ServerResponse, status: number, body: unknown) => {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(body));
+};
+const asaasFake = http.createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://asaas-fake');
+  const path = url.pathname;
+  const chunks: Buffer[] = [];
+  request.on('data', (chunk: Buffer) => chunks.push(chunk));
+  request.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    let body: unknown = null;
+    if (raw) {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return asaasReply(response, 400, { error: 'invalid JSON' });
+      }
+    }
+    if (request.headers.access_token !== ASAAS_TEST_KEY) {
+      return asaasReply(response, 401, { errors: [{ description: 'invalid access_token' }] });
+    }
+    asaasCalls.push({ method: request.method ?? '', path: `${path}${url.search}`, body });
+    if (request.method === 'GET' && path === '/customers') {
+      const externalReference = url.searchParams.get('externalReference');
+      return asaasReply(response, 200, { object: 'list', data: asaasCustomers.filter((customer) => customer.externalReference === externalReference) });
+    }
+    if (request.method === 'POST' && path === '/customers') {
+      const input = body as { name: string; externalReference: string };
+      const customer: AsaasCustomer = { id: `cus_test_${++asaasSeq}`, name: input.name, externalReference: input.externalReference };
+      asaasCustomers.push(customer);
+      return asaasReply(response, 200, { object: 'customer', ...customer });
+    }
+    if (request.method === 'POST' && path === '/payments') {
+      const input = body as { customer: string; billingType: string; value: number; dueDate: string; description: string; externalReference: string };
+      const payment: AsaasPayment = {
+        id: `pay_test_${++asaasSeq}`, customer: input.customer, billingType: input.billingType,
+        value: input.value, dueDate: input.dueDate, description: input.description,
+        externalReference: input.externalReference, status: 'PENDING', deleted: false,
+      };
+      // Resposta perdida: a cobrança EXISTE no provedor, mas o cliente vê 500 —
+      // a reconciliação por externalReference precisa adotá-la sem duplicar.
+      asaasPayments.push(payment);
+      if (asaasCreateThen500) {
+        asaasCreateThen500 = false;
+        return asaasReply(response, 500, { errors: [{ description: 'planned test failure after persisting' }] });
+      }
+      return asaasReply(response, 200, { object: 'payment', id: payment.id, status: payment.status });
+    }
+    if (request.method === 'GET' && path === '/payments') {
+      const externalReference = url.searchParams.get('externalReference');
+      return asaasReply(response, 200, {
+        object: 'list',
+        data: asaasPayments.filter((payment) => payment.externalReference === externalReference)
+          .map((payment) => ({ id: payment.id, status: payment.deleted ? 'DELETED' : payment.status, value: payment.value })),
+      });
+    }
+    const pixMatch = /^\/payments\/([^/]+)\/pixQrCode$/.exec(path);
+    if (request.method === 'GET' && pixMatch) {
+      const payment = asaasPayments.find((candidate) => candidate.id === pixMatch[1]);
+      if (!payment) return asaasReply(response, 404, { errors: [{ description: 'not found' }] });
+      return asaasReply(response, 200, {
+        payload: `00020126pix-copia-e-cola-${payment.id}`,
+        encodedImage: 'aW1hZ2VtLXBpeC1mYWtl',
+        expirationDate: '2026-11-05 23:59:59',
+      });
+    }
+    const paymentMatch = /^\/payments\/([^/]+)$/.exec(path);
+    if (request.method === 'GET' && paymentMatch) {
+      const payment = asaasPayments.find((candidate) => candidate.id === paymentMatch[1]);
+      if (!payment) return asaasReply(response, 404, { errors: [{ description: 'not found' }] });
+      return asaasReply(response, 200, { id: payment.id, status: payment.deleted ? 'DELETED' : payment.status, value: payment.value });
+    }
+    if (request.method === 'DELETE' && paymentMatch) {
+      const payment = asaasPayments.find((candidate) => candidate.id === paymentMatch[1]);
+      if (!payment) return asaasReply(response, 404, { errors: [{ description: 'not found' }] });
+      payment.deleted = true;
+      return asaasReply(response, 200, { id: payment.id, deleted: true });
+    }
+    return asaasReply(response, 404, { errors: [{ description: `unhandled fake route: ${request.method} ${path}` }] });
+  });
+});
+let asaasUrl = '';
+
 async function startApp() {
   // Config is evaluated by buildApp only after the local provider URL is installed.
   app = await buildApp({ WAHA_BASE_URL: providerUrl });
   baseUrl = await app.listen({ port: 0, host: '127.0.0.1' });
 }
+// Reinicia a aplicação com variáveis de ambiente extras (ex.: provider asaas).
+async function restartAppWith(env: Record<string, string>) {
+  Object.assign(process.env, env);
+  if (app) await app.close();
+  app = undefined;
+  await startApp();
+}
+const asaasEnv = () => ({
+  BILLING_PROVIDER: 'asaas',
+  ASAAS_API_KEY: ASAAS_TEST_KEY,
+  ASAAS_BASE_URL: asaasUrl,
+  ASAAS_WEBHOOK_TOKEN: ASAAS_TEST_WEBHOOK_TOKEN,
+});
+const asaasCallsTo = (method: string, pathPrefix: string) =>
+  asaasCalls.filter((call) => call.method === method && call.path.startsWith(pathPrefix));
 async function beginKnownOrder(description: string, customerName: string): Promise<Order> {
   await inbound(description);
   await inbound(customerName);
@@ -437,6 +562,73 @@ async function beginKnownOrder(description: string, customerName: string): Promi
   assert.equal(current.status, 'AGUARDANDO_DADOS');
   assert.equal(current.amount_cents, null);
   return current;
+}
+
+// ===== Helpers Fase 6 (cobrança) =====
+type ChargeRow = {
+  id: string; service_order_id: string; customer_id: string; provider: string;
+  provider_charge_id: string | null; method: string; value_cents: number;
+  due_date: string | null; status: string; external_reference: string;
+  pix_copy_paste: string | null; pix_qr_url: string | null; paid_value_cents: number | null;
+};
+async function charges(): Promise<ChargeRow[]> {
+  return prisma.$queryRawUnsafe<ChargeRow[]>(
+    `SELECT id::text AS id, service_order_id::text AS service_order_id, customer_id::text AS customer_id,
+            provider, provider_charge_id, method, value_cents, due_date::text AS due_date, status,
+            external_reference, pix_copy_paste, pix_qr_url, paid_value_cents
+       FROM charges ORDER BY created_at, id`,
+  );
+}
+type BillingEventRow = { provider: string; provider_event_id: string; event_type: string; charge_id: string | null; processed: boolean };
+async function billingEvents(): Promise<BillingEventRow[]> {
+  return prisma.$queryRawUnsafe<BillingEventRow[]>(
+    'SELECT provider, provider_event_id, event_type, charge_id::text AS charge_id, processed FROM billing_events ORDER BY position',
+  );
+}
+// Notificações espontâneas do tick (sem mensagem de correlação).
+async function notices(): Promise<Outbound[]> {
+  return prisma.$queryRawUnsafe<Outbound[]>(
+    `SELECT id, body, status, attempts, provider_message_id, last_error, reply_to
+       FROM outbound_messages WHERE correlation_message_id IS NULL ORDER BY position`,
+  );
+}
+async function billingWebhook(provider: string, body: unknown, token: string | undefined) {
+  return request(`/webhooks/billing/${provider}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token === undefined ? {} : { 'asaas-access-token': token }) },
+    body: JSON.stringify(body),
+  });
+}
+// Leva uma OS até CONFIRMADA via fluxo guiado por texto (cliente já cadastrado).
+// Reusa o cliente se já existir um com esse nome exato (duplicar o seed
+// tornaria o match ambíguo → CUSTOMER_CHOOSE).
+async function confirmOrder(description: string, customerName: string, value: string): Promise<Order> {
+  const normalized = customerName.trim().replace(/\s+/g, ' ').toLocaleLowerCase('pt-BR');
+  const existing = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+    'SELECT id FROM customers WHERE normalized_name=$1', normalized,
+  );
+  if (!existing[0]) await seedCustomer(customerName);
+  await inbound(description);
+  await inbound(customerName);
+  await pending('VALUE');
+  await inbound(value);
+  await pending('materials');
+  await inbound('não');
+  await pending('CONFIRM');
+  const confirmed = await inbound('sim');
+  assert.match(confirmed.text, /confirmada/i);
+  await pending(null);
+  const order = (await orders()).find((row) => row.description === description);
+  assert.ok(order, `order ${description} must exist`);
+  assert.equal(order.status, 'CONFIRMADA');
+  return order;
+}
+// 'cobrar OS <n> pix <vencimento>' + 'sim' — retorna o resumo e a resposta final.
+async function cobrarPixConfirm(osNumber: number, due = '10/11/2026') {
+  const summary = await inbound(`cobrar OS ${osNumber} pix ${due}`);
+  const done = await inbound('sim');
+  await pending(null);
+  return { summary, done };
 }
 
 const scenarios: Array<[string, () => Promise<void>]> = [
@@ -1692,6 +1884,288 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(await itemQuantity(cabo.id), '8.000');
     await pending(null);
   }],
+  ['cobrar pix happy path: aprovação, customer sync, pix copia-e-cola e charge PENDING', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Instalar tomada', 'Cliente Pix', '150');
+    assert.equal(order.number, 1);
+    const summary = await inbound('cobrar OS 1 pix 10/11/2026');
+    assert.match(summary.text, /Cobrança Pix de R\$ 150,00 para Cliente Pix \(OS 000001\), vencimento 10\/11\/2026\. Confirma\?/);
+    await pending('CHARGE_CONFIRM');
+    const done = await inbound('sim');
+    await pending(null);
+    const charge = (await charges())[0]!;
+    assert.match(done.text, /Cobrança criada: OS 000001 · Pix · R\$ 150,00 · vencimento 10\/11\/2026\./);
+    assert.match(done.text, /Pix copia-e-cola:\n00020126pix-copia-e-cola-/);
+    assert.equal(charge.status, 'PENDING');
+    assert.equal(charge.provider, 'asaas');
+    assert.equal(charge.method, 'PIX');
+    assert.equal(charge.value_cents, 15000);
+    assert.equal(charge.external_reference, 'OS-1-C1');
+    assert.equal(charge.pix_copy_paste, `00020126pix-copia-e-cola-${charge.provider_charge_id}`);
+    assert.equal(charge.pix_qr_url, 'data:image/png;base64,aW1hZ2VtLXBpeC1mYWtl');
+    // Customer sync idempotente: uma só criação de cliente no provedor.
+    assert.equal(asaasCallsTo('POST', '/customers').length, 1);
+    assert.equal(asaasCallsTo('GET', '/customers').length, 1);
+    assert.equal(asaasCallsTo('POST', '/payments').length, 1);
+    assert.equal(asaasCallsTo('GET', `/payments/${charge.provider_charge_id}/pixQrCode`).length, 1);
+    const refs = await prisma.$queryRawUnsafe<Array<{ external_id: string }>>(
+      "SELECT external_id FROM customer_provider_refs WHERE provider='asaas'",
+    );
+    assert.equal(refs.length, 1);
+    // Segunda OS: ensureCustomer reusa a referência persistida (nenhum POST novo).
+    const second = await confirmOrder('Trocar disjuntor', 'Cliente Pix', '80');
+    await cobrarPixConfirm(second.number);
+    assert.equal(asaasCallsTo('POST', '/customers').length, 1);
+    assert.equal((await charges()).length, 2);
+  }],
+  ['webhook RECEIVED atualiza para RECEIVED, notifica operador uma vez e deduplica reenvio idêntico', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico webhook', 'Cliente Webhook', '150');
+    await cobrarPixConfirm(order.number);
+    const charge = (await charges())[0]!;
+    const event = { id: 'evt-received-1', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    const accepted = await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN);
+    assert.equal(accepted.status, 200, accepted.text);
+    assert.deepEqual(JSON.parse(accepted.text), { accepted: true });
+    await tick();
+    const updated = (await charges())[0]!;
+    assert.equal(updated.status, 'RECEIVED');
+    assert.equal(updated.paid_value_cents, 15000);
+    const noticesAfterFirst = await notices();
+    assert.equal(noticesAfterFirst.length, 1);
+    assert.equal(noticesAfterFirst[0]!.status, 'SENT');
+    assert.match(noticesAfterFirst[0]!.body, /Cobrança OS 000001 recebida: R\$ 150,00/);
+    // Reenvio idêntico: dedup por (provider, provider_event_id) — nada muda.
+    assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await billingEvents()).length, 1);
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await notices()).length, 1);
+    // Evento NOVO do mesmo tipo para cobrança já RECEIVED: processado, no-op.
+    const again = { id: 'evt-received-2', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    assert.equal((await billingWebhook('asaas', again, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await billingEvents()).length, 2);
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await notices()).length, 1, 'RECEIVED nunca é rebaixado nem notificado de novo');
+  }],
+  ['webhook com token inválido recebe 401 e nada persiste', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico token', 'Cliente Token', '150');
+    await cobrarPixConfirm(order.number);
+    const charge = (await charges())[0]!;
+    const event = { id: 'evt-bad-token', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    for (const token of ['wrong-token', '']) {
+      const response = await billingWebhook('asaas', event, token);
+      assert.equal(response.status, 401, token);
+      assert.deepEqual(JSON.parse(response.text), { error: 'invalid_token' });
+    }
+    assert.equal((await billingWebhook('asaas', event, undefined)).status, 401);
+    // Provider divergente do configurado: 404.
+    assert.equal((await billingWebhook('manual', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 404);
+    await tick();
+    assert.equal((await billingEvents()).length, 0);
+    assert.equal((await charges())[0]!.status, 'PENDING');
+    assert.equal((await notices()).length, 0);
+  }],
+  ['webhook de cobrança desconhecida persiste o evento, não quebra e não notifica', async () => {
+    await restartAppWith(asaasEnv());
+    const event = { id: 'evt-unknown-charge', event: 'PAYMENT_RECEIVED', payment: { id: 'pay_inexistente', value: 42 } };
+    assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    const events = await billingEvents();
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.event_type, 'RECEIVED');
+    assert.equal(events[0]!.processed, true);
+    assert.equal(events[0]!.charge_id, null);
+    assert.equal((await charges()).length, 0);
+    assert.equal((await notices()).length, 0);
+    // Evento sem payment.id (ex.: transferência): aceito e ignorado, nada persiste.
+    const ignored = await billingWebhook('asaas', { id: 'evt-transfer', event: 'TRANSFER_DONE' }, ASAAS_TEST_WEBHOOK_TOKEN);
+    assert.equal(ignored.status, 200);
+    assert.deepEqual(JSON.parse(ignored.text), { accepted: true, ignored: true });
+    assert.equal((await billingEvents()).length, 1);
+  }],
+  ['tick marca cobrança vencida como OVERDUE e notifica uma única vez em ticks repetidos', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico vencido', 'Cliente Vencido', '150');
+    await cobrarPixConfirm(order.number, '01/01/2020');
+    // O sweep roda no mesmo tick que cria a cobrança já vencida: transição
+    // PENDING → OVERDUE com exatamente um aviso ao operador.
+    const overdue = (await charges())[0]!;
+    assert.equal(overdue.status, 'OVERDUE');
+    const noticesAfterSweep = await notices();
+    assert.equal(noticesAfterSweep.length, 1);
+    assert.match(noticesAfterSweep[0]!.body, /Cobrança OS 000001 vencida \(R\$ 150,00, venceu 01\/01\)/);
+    await tick();
+    await tick();
+    assert.equal((await notices()).length, 1, 'ticks repetidos não notificam de novo');
+    assert.equal((await charges())[0]!.status, 'OVERDUE');
+    // Webhook OVERDUE posterior (mesma transição) também não duplica o aviso.
+    const event = { id: 'evt-overdue-1', event: 'PAYMENT_OVERDUE', payment: { id: overdue.provider_charge_id } };
+    assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await notices()).length, 1);
+  }],
+  ['recebi com cobrança pendente marca RECEIVED; webhook RECEIVED posterior é no-op', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico recebido', 'Cliente Recebido', '150');
+    await cobrarPixConfirm(order.number);
+    const confirm = await inbound('recebi OS 1 150 dinheiro');
+    assert.match(confirm.text, /Registrar recebimento de R\$ 150,00 da OS 000001 \(dinheiro\)\? Responda sim ou cancelar\./);
+    await pending('RECEIPT_CONFIRM');
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Recebimento registrado: OS 000001, R\$ 150,00 \(dinheiro\)\./);
+    const charge = (await charges())[0]!;
+    assert.equal(charge.status, 'RECEIVED');
+    assert.equal(charge.paid_value_cents, 15000);
+    assert.equal((await notices()).length, 0);
+    // Webhook RECEIVED posterior do provedor: no-op (não rebaixa, não notifica).
+    const event = { id: 'evt-late-received', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await charges())[0]!.paid_value_cents, 15000);
+    assert.equal((await notices()).length, 0);
+    // Nem webhook OVERDUE rebaixa RECEIVED.
+    const lateOverdue = { id: 'evt-late-overdue', event: 'PAYMENT_OVERDUE', payment: { id: charge.provider_charge_id } };
+    assert.equal((await billingWebhook('asaas', lateOverdue, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await notices()).length, 0);
+  }],
+  ['recebi sem cobrança cria registro manual RECEIVED (dinheiro e pix externo)', async () => {
+    const order = await confirmOrder('Servico externo', 'Cliente Externo', '150');
+    const cashConfirm = await inbound(`recebi OS ${order.number} 150`);
+    assert.match(cashConfirm.text, /\(dinheiro\)/);
+    const cash = await inbound('sim');
+    assert.match(cash.text, /Recebimento registrado: OS 000001, R\$ 150,00 \(dinheiro\)\./);
+    const pixConfirm = await inbound(`recebi OS ${order.number} 80 pix`);
+    assert.match(pixConfirm.text, /Registrar recebimento de R\$ 80,00 da OS 000001 \(pix\)/);
+    const pix = await inbound('sim');
+    assert.match(pix.text, /Recebimento registrado: OS 000001, R\$ 80,00 \(pix\)\./);
+    const rows = await charges();
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0]!.provider, 'manual');
+    assert.equal(rows[0]!.method, 'CASH');
+    assert.equal(rows[0]!.status, 'RECEIVED');
+    assert.equal(rows[0]!.paid_value_cents, 15000);
+    assert.equal(rows[0]!.external_reference, 'OS-1-C1');
+    assert.equal(rows[1]!.method, 'EXTERNAL_PIX');
+    assert.equal(rows[1]!.paid_value_cents, 8000);
+    assert.equal(rows[1]!.external_reference, 'OS-1-C2');
+    assert.match(rows[0]!.provider_charge_id!, /^manual-charge-/);
+    assert.equal(asaasCalls.length, 0, 'recebi nunca fala com o provedor de cobrança');
+    // Valor inválido e OS inexistente: rejeições determinísticas.
+    assert.match((await inbound('recebi OS 1 abc')).text, /Valor inválido/);
+    assert.match((await inbound('recebi OS 99 100')).text, /OS não encontrada/);
+    assert.match((await inbound('recebi OS 1')).text, /Use: recebi OS/);
+    assert.equal((await charges()).length, 2);
+  }],
+  ['timeout na criação reconcilia por externalReference sem duplicar cobrança no provedor', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico timeout', 'Cliente Timeout', '150');
+    asaasCreateThen500 = true; // a cobrança é gravada no provedor, mas a resposta se perde
+    const summary = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    assert.match(summary.text, /Confirma\?/);
+    const done = await inbound('sim');
+    assert.match(done.text, /Cobrança criada: OS 000001/);
+    assert.match(done.text, /Pix copia-e-cola/);
+    // UMA cobrança no provedor: o 500 foi reconciliado via findByExternalReference.
+    assert.equal(asaasPayments.length, 1);
+    assert.equal(asaasCallsTo('POST', '/payments').length, 1);
+    assert.equal(asaasCallsTo('GET', '/payments?externalReference=OS-1-C1').length, 1);
+    const charge = (await charges())[0]!;
+    assert.equal(charge.status, 'PENDING');
+    assert.equal(charge.provider_charge_id, asaasPayments[0]!.id);
+    assert.equal(charge.external_reference, 'OS-1-C1');
+  }],
+  ['cancelar cobrança chama DELETE no provedor e marca CANCELED', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico cancelado', 'Cliente Cancelado', '150');
+    await cobrarPixConfirm(order.number);
+    const charge = (await charges())[0]!;
+    const withoutActive = await inbound(`cancelar cobrança OS ${order.number}`);
+    assert.match(withoutActive.text, /Cancelar a cobrança PIX de R\$ 150,00 da OS 000001\? Responda sim ou cancelar\./);
+    await pending('CANCEL_CHARGE_CONFIRM');
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Cobrança da OS 000001 cancelada\./);
+    assert.equal((await charges())[0]!.status, 'CANCELED');
+    assert.equal(asaasCallsTo('DELETE', `/payments/${charge.provider_charge_id}`).length, 1);
+    assert.equal(asaasPayments[0]!.deleted, true);
+    // Segunda tentativa: não há mais cobrança ativa.
+    assert.match((await inbound(`cancelar cobrança OS ${order.number}`)).text, /Não há cobrança ativa/);
+    assert.equal(asaasCallsTo('DELETE', '/payments').length, 1);
+  }],
+  ['provider none responde determinístico e recebi continua funcionando', async () => {
+    // Sem BILLING_PROVIDER no ambiente (padrão 'none').
+    const order = await confirmOrder('Servico sem provider', 'Cliente Sem Provider', '150');
+    const cobrar = await inbound(`cobrar OS ${order.number} pix`);
+    assert.match(cobrar.text, /Cobrança automática não configurada \(BILLING_PROVIDER=none\)\. Use 'recebi OS <n> <valor>' para registrar pagamento externo\./);
+    await pending(null);
+    assert.equal((await charges()).length, 0);
+    assert.match((await inbound('cobrar OS 1')).text, /BILLING_PROVIDER=none/);
+    await inbound(`recebi OS ${order.number} 150 dinheiro`);
+    const done = await inbound('sim');
+    assert.match(done.text, /Recebimento registrado: OS 000001, R\$ 150,00 \(dinheiro\)\./);
+    const charge = (await charges())[0]!;
+    assert.equal(charge.provider, 'manual');
+    assert.equal(charge.status, 'RECEIVED');
+  }],
+  ['cobrar rejeita OS não confirmada, OS sem valor e OS com cobrança ativa', async () => {
+    await restartAppWith(asaasEnv());
+    // OS não confirmada (AGUARDANDO_DADOS) — seed direto, sem conversa pendente.
+    const pendingCustomerId = await seedCustomer('Cliente Pendente');
+    await prisma.$executeRawUnsafe(
+      "INSERT INTO service_orders(customer_id, description, status) VALUES($1::uuid, 'Servico pendente', 'AGUARDANDO_DADOS')",
+      pendingCustomerId,
+    );
+    const rejected = await inbound('cobrar OS 1 pix');
+    assert.match(rejected.text, /A OS 000001 não está confirmada \(status: AGUARDANDO_DADOS\)/);
+    await pending(null);
+    assert.equal((await charges()).length, 0);
+    // OS confirmada sem valor.
+    await seedOrder('Servico sem valor', 'Cliente Sem Valor'); // OS 2, CONFIRMADA, amount null
+    const noValue = await inbound('cobrar OS 2 pix');
+    assert.match(noValue.text, /A OS 000002 não tem valor definido; não é possível cobrar\./);
+    await pending(null);
+    // OS com cobrança ativa.
+    const third = await confirmOrder('Servico duplo', 'Cliente Duplo', '100'); // OS 3
+    await cobrarPixConfirm(third.number);
+    const active = await inbound('cobrar OS 3 pix');
+    assert.match(active.text, /Já há cobrança ativa para a OS 000003: PIX R\$ 100,00 vence 10\/11\/2026 \(PENDING\)/);
+    await pending(null);
+    assert.equal((await charges()).length, 1);
+    assert.equal(asaasCallsTo('POST', '/payments').length, 1);
+  }],
+  ['cobrar boleto cria BOLETO sem buscar dados pix', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico boleto', 'Cliente Boleto', '200');
+    // Fluxo guiado completo: método perguntado, vencimento com default.
+    const askMethod = await inbound(`cobrar OS ${order.number}`);
+    assert.match(askMethod.text, /Método da cobrança\? Responda pix ou boleto\./);
+    await pending('CHARGE_METHOD');
+    const askDue = await inbound('boleto');
+    assert.match(askDue.text, /Vencimento\? Responda DD\/MM\/AAAA, \+Nd ou - para usar/);
+    await pending('CHARGE_DUE');
+    const summary = await inbound('20/11/2026');
+    assert.match(summary.text, /Cobrança Boleto de R\$ 200,00 para Cliente Boleto \(OS 000001\), vencimento 20\/11\/2026\. Confirma\?/);
+    await pending('CHARGE_CONFIRM');
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Cobrança criada: OS 000001 · Boleto · R\$ 200,00 · vencimento 20\/11\/2026\./);
+    assert.match(done.text, /link disponível no painel Asaas\./);
+    assert.doesNotMatch(done.text, /copia-e-cola/);
+    const charge = (await charges())[0]!;
+    assert.equal(charge.method, 'BOLETO');
+    assert.equal(charge.status, 'PENDING');
+    assert.equal(charge.pix_copy_paste, null);
+    assert.equal(charge.pix_qr_url, null);
+    assert.equal(asaasPayments[0]!.billingType, 'BOLETO');
+    assert.equal(asaasCallsTo('GET', `/payments/${charge.provider_charge_id}/pixQrCode`).length, 0, 'boleto não busca pix');
+  }],
 ];
 
 let passed = 0;
@@ -1705,6 +2179,8 @@ try {
   await listen(provider);
   providerUrl = `http://127.0.0.1:${(provider.address() as AddressInfo).port}`;
   process.env.WAHA_BASE_URL = providerUrl;
+  await listen(asaasFake);
+  asaasUrl = `http://127.0.0.1:${(asaasFake.address() as AddressInfo).port}`;
   // In the compose verify overlay GROQ_BASE_URL points at the groq-test service
   // (scripts/test-groq-server.mjs); without it, run the in-process mirror.
   if (!process.env.GROQ_BASE_URL) {
@@ -1719,6 +2195,11 @@ try {
     // different configuration mutate and restart, then must restore it.
     process.env.GROQ_API_KEY = settings.GROQ_API_KEY;
     process.env.WAHA_MEDIA_MAX_BYTES = settings.WAHA_MEDIA_MAX_BYTES;
+    delete process.env.BILLING_PROVIDER;
+    delete process.env.ASAAS_API_KEY;
+    delete process.env.ASAAS_BASE_URL;
+    delete process.env.ASAAS_WEBHOOK_TOKEN;
+    delete process.env.INVOICE_PROVIDER;
     if (app) await app.close();
     app = undefined;
     await startApp();
@@ -1739,7 +2220,13 @@ try {
   } finally {
     try {
       provider.closeAllConnections();
+      asaasFake.closeAllConnections();
       if (provider.listening) await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
+      if (asaasFake.listening) {
+        const closed = Promise.withResolvers<void>();
+        asaasFake.close((error) => error ? closed.reject(error) : closed.resolve());
+        await closed.promise;
+      }
     } finally {
       try {
         if (groqFake.listening) await new Promise<void>((resolve, reject) => groqFake.close((error) => error ? reject(error) : resolve()));

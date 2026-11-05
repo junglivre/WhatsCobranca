@@ -18,6 +18,17 @@ const schema = z.object({
   GROQ_STT_MODEL: z.string().min(1).default('whisper-large-v3'),
   GROQ_LLM_MODEL: z.string().min(1).default('llama-3.3-70b-versatile'),
   WAHA_MEDIA_MAX_BYTES: z.coerce.number().int().positive().default(16777216),
+  // Fase 6 — financeiro plugável. 'none' desliga a cobrança automática (o
+  // comando 'recebi' continua registrando recebimento externo via provider
+  // manual); 'asaas' exige ASAAS_API_KEY e ASAAS_WEBHOOK_TOKEN (registry
+  // falha no boot se faltar).
+  BILLING_PROVIDER: z.enum(['none', 'manual', 'asaas']).default('none'),
+  ASAAS_API_KEY: z.string().trim().default(''),
+  ASAAS_BASE_URL: z.string().url().default('https://api-sandbox.asaas.com/v3'),
+  ASAAS_WEBHOOK_TOKEN: z.string().trim().default(''),
+  // Fase 6 — porta fiscal: só o adapter 'manual' (pendência para emissão
+  // humana) existe nesta fase; fluxo de conversa fiscal é Fase 7.
+  INVOICE_PROVIDER: z.enum(['none', 'manual']).default('none'),
 });
 export type Config = z.infer<typeof schema>;
 export const config = (env = process.env): Config => schema.parse(env);

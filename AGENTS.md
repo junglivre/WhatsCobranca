@@ -43,6 +43,16 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - Itens de OS são imutáveis após `CONFIRMADA`/`CANCELADA`; `corrigir materiais` apaga e reabre a lista APENAS em rascunho.
 - Órdem de exibição dos itens usa a coluna `position` (ordem de digitação), nunca `created_at` (idêntico na mesma transação).
 
+## Invariantes de integrações (Fase 6)
+
+- O domínio importa SÓ `src/providers/*/types.ts` + `registry.ts`. Proibido fetch a provedor fora do adapter e proibido persistir status/payload cru de provedor como estado (o adapter traduz para o vocabulário interno; o payload bruto vai só para `billing_events.payload`, para perícia).
+- Toda cobrança nasce `DRAFT` com `external_reference` ANTES da chamada ao provedor. Após timeout/5xx, reconciliar via `findByExternalReference` antes de reenviar — nunca presumir falha, nunca duplicar.
+- Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior. `CONFIRMED` não notifica o operador (ainda não é dinheiro).
+- Webhook financeiro: 200 rápido, dedup por `(provider, provider_event_id)`, processamento assíncrono no tick. Token inválido → 401 sem persistir nada.
+- Notificação ao operador só em transição de status, com `dedup_key` `billing:<chargeId>:<status>` (webhook e sweep de vencidas compartilham a chave — nunca aviso duplo).
+- Dinheiro em `value_cents` integer; conversão para reais só dentro do adapter.
+- Credenciais (`ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`) só no `.env` local, nunca em código, teste ou log de erro (erros do adapter truncam corpo e omitem headers).
+
 ## Antes de abrir PR
 
 - Rode `npm run verify` (requer Docker Compose ≥ 2.24.4) e cole a saída completa.

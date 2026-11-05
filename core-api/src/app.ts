@@ -2,8 +2,11 @@ import Fastify from 'fastify';
 import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { config, type Config } from './config.js';
-import { processMessage } from './domain.js';
+import { processMessage, queueNotice } from './domain.js';
 import { validHmac, sendWaha, SendFailure } from './waha.js';
+import { formatMoney, osLabel } from './types.js';
+import { getBillingProvider } from './providers/registry.js';
+import { WebhookAuthError, type NormalizedBillingEvent } from './providers/billing/types.js';
 
 type OperatorRow = { id: string };
 type IdentityRow = { operator_id: string };
@@ -209,8 +212,143 @@ async function deliver(prisma: PrismaClient, cfg: Config): Promise<number> {
   return sent;
 }
 
+// ===== Fase 6: processamento assíncrono de billing_events no tick =====
+//
+// O webhook só persiste (dedup por UNIQUE(provider, provider_event_id)) e
+// responde 200; o tick aplica as transições em ordem `position`:
+//   RECEIVED  ← PENDING/OVERDUE/CONFIRMED (grava paid_value_cents)
+//   OVERDUE   ← PENDING
+//   CONFIRMED ← PENDING/OVERDUE
+//   CANCELED/REFUNDED ← qualquer estado exceto RECEIVED
+// RECEIVED nunca é rebaixado (UPDATE condicional não casa) — um 'recebi'
+// manual anterior torna o webhook RECEIVED posterior um no-op.
+// Notificação ao operador SÓ quando o status muda para RECEIVED/OVERDUE/
+// CANCELED/REFUNDED, com dedup_key por transição (webhook + sweep não
+// duplicam aviso).
+
+type BillingEventRow = { id: string; provider: string; event_type: string; payload: unknown };
+type ChargeNoticeRow = {
+  id: string;
+  service_order_id: string;
+  value_cents: number;
+  paid_value_cents: number | null;
+  due_date: Date | string | null;
+  number: number;
+};
+
+function dueShort(value: Date | string | null): string {
+  if (value === null) return '—';
+  const iso = value instanceof Date ? value.toISOString().slice(0, 10) : value.slice(0, 10);
+  return new Date(`${iso}T12:00:00Z`).toLocaleDateString('pt-BR', { timeZone: 'UTC' }).slice(0, 5);
+}
+
+function billingNoticeBody(status: string, charge: ChargeNoticeRow): string {
+  const label = osLabel(charge.number);
+  switch (status) {
+    case 'RECEIVED':
+      return `Cobrança ${label} recebida: ${formatMoney(charge.paid_value_cents ?? charge.value_cents)}`;
+    case 'OVERDUE':
+      return `Cobrança ${label} vencida (${formatMoney(charge.value_cents)}, venceu ${dueShort(charge.due_date)})`;
+    case 'CANCELED':
+      return `Cobrança ${label} cancelada.`;
+    default:
+      return `Cobrança ${label} estornada (${formatMoney(charge.value_cents)}).`;
+  }
+}
+
+async function processBillingEvents(prisma: PrismaClient, cfg: Config, operator: OperatorRow): Promise<number> {
+  const events = await prisma.$queryRawUnsafe<BillingEventRow[]>(
+    'SELECT id, provider, event_type, payload FROM billing_events WHERE NOT processed ORDER BY position LIMIT 20',
+  );
+  let processed = 0;
+  for (const event of events) {
+    const normalized = event.payload as NormalizedBillingEvent;
+    await prisma.$transaction(async (tx) => {
+      const charges = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        'SELECT id FROM charges WHERE provider=$1 AND provider_charge_id=$2',
+        event.provider, normalized.providerChargeId,
+      );
+      const charge = charges[0];
+      const returning = `RETURNING id, service_order_id, value_cents, paid_value_cents, due_date,
+                   (SELECT number FROM service_orders WHERE id=charges.service_order_id) AS number`;
+      // [novo status, transição permitida de...] — UPDATE condicional: sem
+      // linha retornada o evento é no-op (RECEIVED nunca é rebaixado).
+      let newStatus: 'RECEIVED' | 'OVERDUE' | 'CONFIRMED' | 'CANCELED' | 'REFUNDED' | null = null;
+      let transitioned: ChargeNoticeRow | undefined;
+      if (charge && normalized.type === 'RECEIVED') {
+        newStatus = 'RECEIVED';
+        transitioned = (await tx.$queryRawUnsafe<ChargeNoticeRow[]>(
+          `UPDATE charges SET status='RECEIVED',
+                  paid_value_cents=COALESCE($2, paid_value_cents, value_cents), updated_at=now()
+            WHERE id=$1::uuid AND status IN ('PENDING','OVERDUE','CONFIRMED') ${returning}`,
+          charge.id, normalized.paidValueCents ?? null,
+        ))[0];
+      } else if (charge && normalized.type === 'OVERDUE') {
+        newStatus = 'OVERDUE';
+        transitioned = (await tx.$queryRawUnsafe<ChargeNoticeRow[]>(
+          `UPDATE charges SET status='OVERDUE', updated_at=now()
+            WHERE id=$1::uuid AND status='PENDING' ${returning}`,
+          charge.id,
+        ))[0];
+      } else if (charge && normalized.type === 'CONFIRMED') {
+        newStatus = 'CONFIRMED';
+        transitioned = (await tx.$queryRawUnsafe<ChargeNoticeRow[]>(
+          `UPDATE charges SET status='CONFIRMED', updated_at=now()
+            WHERE id=$1::uuid AND status IN ('PENDING','OVERDUE') ${returning}`,
+          charge.id,
+        ))[0];
+      } else if (charge && (normalized.type === 'CANCELED' || normalized.type === 'REFUNDED')) {
+        newStatus = normalized.type;
+        transitioned = (await tx.$queryRawUnsafe<ChargeNoticeRow[]>(
+          `UPDATE charges SET status=$2, updated_at=now()
+            WHERE id=$1::uuid AND status <> 'RECEIVED' AND status <> $2 ${returning}`,
+          charge.id, normalized.type,
+        ))[0];
+      }
+      // CREATED/PARTIAL/OTHER (e cobrança desconhecida): persistidos para
+      // perícia, sem transição e sem notificação.
+      await tx.$executeRawUnsafe(
+        'UPDATE billing_events SET charge_id=$2::uuid, processed=true, processed_at=now() WHERE id=$1::uuid',
+        event.id, charge?.id ?? null,
+      );
+      // CONFIRMED não notifica: ainda não é dinheiro recebido.
+      if (transitioned && newStatus && newStatus !== 'CONFIRMED') {
+        await queueNotice(
+          tx, operator.id, cfg.OPERATOR_LID,
+          billingNoticeBody(newStatus, transitioned),
+          `billing:${transitioned.id}:${newStatus}`,
+        );
+      }
+    });
+    processed += 1;
+  }
+  return processed;
+}
+
+// Sweep de vencidas: PENDING com due_date anterior ao dia de hoje em
+// America/Sao_Paulo vira OVERDUE, uma notificação por cobrança que
+// transicionou (dedup_key compartilhada com o webhook OVERDUE).
+async function sweepOverdueCharges(prisma: PrismaClient, cfg: Config, operator: OperatorRow): Promise<number> {
+  return prisma.$transaction(async (tx) => {
+    const rows = await tx.$queryRawUnsafe<ChargeNoticeRow[]>(
+      `UPDATE charges SET status='OVERDUE', updated_at=now()
+        WHERE status='PENDING' AND due_date IS NOT NULL
+          AND due_date < (now() AT TIME ZONE 'America/Sao_Paulo')::date
+        RETURNING id, service_order_id, value_cents, paid_value_cents, due_date,
+                  (SELECT number FROM service_orders WHERE id=charges.service_order_id) AS number`,
+    );
+    for (const row of rows) {
+      await queueNotice(tx, operator.id, cfg.OPERATOR_LID, billingNoticeBody('OVERDUE', row), `billing:${row.id}:OVERDUE`);
+    }
+    return rows.length;
+  });
+}
+
 export async function buildApp(overrides: Partial<Config> = {}) {
   const cfg = { ...config(), ...overrides };
+  // Fail-fast no boot: BILLING_PROVIDER=asaas sem credencial é erro de
+  // operação — o serviço não sobe pela metade.
+  const billing = getBillingProvider(cfg);
   const prisma = new PrismaClient();
   const app = Fastify({ logger: false, bodyLimit: cfg.BODY_LIMIT_BYTES });
 
@@ -274,6 +412,41 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     return { accepted: true };
   });
 
+  // Webhook financeiro: resposta 200 rápida, dedup por
+  // UNIQUE(provider, provider_event_id), processamento assíncrono no tick.
+  app.post('/webhooks/billing/:provider', async (request, reply) => {
+    const { provider } = request.params as { provider: string };
+    if (!billing || provider !== billing.name) {
+      return reply.code(404).send({ error: 'unknown_provider' });
+    }
+    let parsed: unknown = null;
+    const raw = request.body;
+    if (Buffer.isBuffer(raw)) {
+      try {
+        parsed = JSON.parse(raw.toString('utf8'));
+      } catch {
+        parsed = null; // corpo inválido: adapter devolve null → 200 + ignored
+      }
+    }
+    let event: NormalizedBillingEvent | null;
+    try {
+      event = billing.validateAndNormalizeWebhook(request.headers, parsed);
+    } catch (error) {
+      if (error instanceof WebhookAuthError) {
+        return reply.code(401).send({ error: 'invalid_token' });
+      }
+      throw error;
+    }
+    if (!event) return { accepted: true, ignored: true };
+    await prisma.$executeRawUnsafe(
+      `INSERT INTO billing_events(provider, provider_event_id, event_type, payload)
+       VALUES($1, $2, $3, $4::jsonb)
+       ON CONFLICT (provider, provider_event_id) DO NOTHING`,
+      provider, event.providerEventId, event.type, JSON.stringify(event),
+    );
+    return { accepted: true };
+  });
+
   app.post('/automation/tick', async (request, reply) => {
     if (request.headers.authorization !== `Bearer ${cfg.AUTOMATION_TOKEN}`) {
       return reply.code(401).send({ error: 'unauthorized' });
@@ -285,7 +458,19 @@ export async function buildApp(overrides: Partial<Config> = {}) {
       processed += 1;
       sent += await deliver(prisma, cfg);
     }
-    return { processed, sent };
+    // Fase 6: billing_events FIFO + sweep de vencidas; notificações entram
+    // na outbox e são entregues neste mesmo tick.
+    const operators = await prisma.$queryRawUnsafe<OperatorRow[]>(
+      "SELECT id FROM operators WHERE label='operador-poc1'",
+    );
+    const operator = operators[0];
+    if (!operator) throw new Error('POC operator was not created');
+    const billingProcessed = await processBillingEvents(prisma, cfg, operator);
+    const overdue = await sweepOverdueCharges(prisma, cfg, operator);
+    if (billingProcessed > 0 || overdue > 0) {
+      sent += await deliver(prisma, cfg);
+    }
+    return { processed, sent, billingProcessed, overdue };
   });
 
   app.addHook('onClose', async () => prisma.$disconnect());

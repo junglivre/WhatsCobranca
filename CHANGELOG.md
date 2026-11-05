@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — Fase 6: Financeiro plugável
+
+- Portas `BillingProvider`/`InvoiceProvider` + registry por env (`BILLING_PROVIDER`, `INVOICE_PROVIDER`): provedores são adapters trocáveis, nunca acoplados ao domínio. Adapter `manual` é a referência mínima para novos provedores; NFS-e fica pronta para adapter do Portal Nacional direto (sem terceiro) ou Asaas (Fase 7).
+- Adapter Asaas (sandbox): sync idempotente de clientes por `externalReference`, cobranças Pix/boleto, QR copia-e-cola, cancelamento, reconciliação de timeout por `externalReference`.
+- Comandos: `cobrar OS n [pix|boleto] [vencimento]`, `cobranças`, `vencidas`, `recebi OS n <valor> [pix|dinheiro]`, `cancelar cobrança OS n`.
+- Webhook `/webhooks/billing/:provider`: token, 200 rápido, dedup por `(provider, provider_event_id)`, processamento FIFO no tick; sweep diário de vencidas; notificações ao operador com dedup por transição. `RECEIVED` nunca é rebaixado; só `RECEIVED` conta como dinheiro.
+- Intenção `DRAFT` persistida antes de qualquer chamada ao provedor; erro nunca é presumido sem reconciliar.
+- 12 cenários novos (48 no total).
+
 ## 0.3.0 — Fase 5: Estoque/materiais
 
 - `inventory_items` + `service_order_items` (reintroduzida) + `stock_movements` (IN/OUT/ADJUST/RETURN) com quantidades `numeric(12,3)` — aritmética sempre no SQL, nunca Float em JS.

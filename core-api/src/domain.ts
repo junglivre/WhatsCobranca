@@ -3,6 +3,8 @@ import type { JsonRecord, Tx } from './types.js';
 import { formatMoney, formatQty, isNo, isYes, normalize, osLabel, parseMoney, parseQuantity } from './types.js';
 import { downloadWahaMedia, MediaFailure } from './waha.js';
 import { extractServiceIntent, GroqFailure, transcribeAudio, type Extraction } from './groq.js';
+import { getBillingProvider } from './providers/registry.js';
+import type { CreatedCharge } from './providers/billing/types.js';
 
 type Purpose = 'CREATE' | 'QUERY' | 'MATERIAL';
 type CustomerRow = { id: string; name: string };
@@ -54,6 +56,19 @@ type ConversationPayload = {
   // Comandos de estoque executados durante CONFIRM restauram o estado da OS
   // depois de executar (snapshot do payload de confirmação + orderId).
   restoreConfirm?: { payload: ConversationPayload; orderId: string };
+  // ===== Fase 6 (cobrança) — a OS referenciada fica SÓ no payload
+  // (chargeOsId), nunca em conversation_states.service_order_id: cancelar a
+  // conversa de cobrança não pode cancelar a OS (cancelPending cancela a OS
+  // quando service_order_id está preenchido).
+  chargeOsId?: string;
+  chargeOsNumber?: number;
+  chargeCustomerName?: string;
+  chargeMethod?: 'PIX' | 'BOLETO';
+  chargeDueDate?: string;
+  chargeValueCents?: number;
+  chargeDbId?: string;
+  receiptCents?: number;
+  receiptMethod?: 'CASH' | 'EXTERNAL_PIX';
 };
 
 const thirtyMinutes = () => new Date(Date.now() + 30 * 60 * 1000);
@@ -122,6 +137,19 @@ function payloadOf(value: unknown): ConversationPayload {
       if (typeof orderId !== 'string' || orderId.length === 0 || typeof inner !== 'object' || inner === null) return undefined;
       return { payload: payloadOf(inner), orderId };
     })(),
+    chargeOsId: typeof record.chargeOsId === 'string' && record.chargeOsId.length > 0 ? record.chargeOsId : undefined,
+    chargeOsNumber: typeof record.chargeOsNumber === 'number' && Number.isSafeInteger(record.chargeOsNumber) && record.chargeOsNumber > 0
+      ? record.chargeOsNumber
+      : undefined,
+    chargeCustomerName: typeof record.chargeCustomerName === 'string' ? record.chargeCustomerName : undefined,
+    chargeMethod: record.chargeMethod === 'PIX' || record.chargeMethod === 'BOLETO' ? record.chargeMethod : undefined,
+    chargeDueDate: typeof record.chargeDueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(record.chargeDueDate)
+      ? record.chargeDueDate
+      : undefined,
+    chargeValueCents: positiveCents(record.chargeValueCents),
+    chargeDbId: typeof record.chargeDbId === 'string' && record.chargeDbId.length > 0 ? record.chargeDbId : undefined,
+    receiptCents: positiveCents(record.receiptCents),
+    receiptMethod: record.receiptMethod === 'CASH' || record.receiptMethod === 'EXTERNAL_PIX' ? record.receiptMethod : undefined,
   };
 }
 
@@ -156,6 +184,26 @@ async function queueReply(
      VALUES($1::uuid, $2::uuid, $3, $4, $5)
      ON CONFLICT (dedup_key) DO NOTHING`,
     operatorId, sourceMessageId, replyTo, body, `${sourceMessageId}:${suffix}`,
+  );
+}
+
+// Notificação espontânea ao operador (sem mensagem de correlação) — usada
+// pelo /automation/tick para avisar transições financeiras (cobrança
+// recebida/vencida/cancelada/estornada). dedup_key obrigatória e única por
+// transição: ON CONFLICT DO NOTHING garante notificação única mesmo com
+// webhook reenviado, sweep repetido ou eventos duplicados.
+export async function queueNotice(
+  tx: Tx,
+  operatorId: string,
+  replyTo: string,
+  body: string,
+  dedupKey: string,
+): Promise<void> {
+  await tx.$executeRawUnsafe(
+    `INSERT INTO outbound_messages(operator_id, correlation_message_id, reply_to, body, dedup_key)
+     VALUES($1::uuid, NULL, $2, $3, $4)
+     ON CONFLICT (dedup_key) DO NOTHING`,
+    operatorId, replyTo, body, dedupKey,
   );
 }
 
@@ -1000,6 +1048,544 @@ async function confirmMaterialOperation(
   await queueReply(tx, operatorId, sourceMessageId, replyTo, replyBody, suffix);
 }
 
+// ===== Cobrança (Fase 6) =====
+//
+// Gramática determinística (o domínio fala SÓ com a porta BillingProvider +
+// registry — nunca com um provedor direto, nunca com status cru):
+//   cobrar OS <n> [pix|boleto] [vencimento DD/MM/AAAA | +Nd]
+//     Validações em ordem: OS existe e está CONFIRMADA; amount_cents > 0;
+//     sem cobrança PENDING/OVERDUE ativa para a mesma OS. Incompleto →
+//     pergunta guiada (método → vencimento; default de vencimento = due_date
+//     da OS, senão hoje) → resumo → pending CHARGE_CONFIRM → 'sim': INSERT
+//     DRAFT + external_reference OS-<n>-C<seq> ANTES de chamar o provedor →
+//     ensureCustomer (persistindo customer_provider_refs) → createCharge →
+//     falha (timeout/5xx): reconciliar via findByExternalReference antes de
+//     qualquer retry — achou, adota; senão status ERROR + mensagem
+//     determinística. Sucesso → PENDING + provider_charge_id; PIX busca
+//     getPixData e responde com o copia-e-cola.
+//   cobranças — lista PENDING/OVERDUE.
+//   vencidas — só OVERDUE + total.
+//   recebi OS <n> <valor> [pix|dinheiro] — confirmação → se há cobrança
+//     PENDING/OVERDUE da OS: transaciona para RECEIVED + paid_value_cents
+//     (webhook posterior do provedor vira no-op: RECEIVED nunca é rebaixado);
+//     senão INSERT charge via provider 'manual' (CASH/EXTERNAL_PIX) RECEIVED.
+//   cancelar cobrança OS <n> — exige PENDING/OVERDUE; confirmação →
+//     provider.cancelCharge → status CANCELED.
+// BILLING_PROVIDER=none → 'cobrar' responde determinístico; 'recebi' segue
+// funcionando (provider manual).
+
+type ChargeOrderRow = {
+  id: string;
+  number: number;
+  status: string;
+  amount_cents: number | null;
+  due_date: Date | string | null;
+  customer_id: string;
+  customer: string;
+  description: string;
+};
+type ChargeRow = {
+  id: string;
+  service_order_id: string;
+  provider: string;
+  provider_charge_id: string | null;
+  method: string;
+  value_cents: number;
+  due_date: Date | string | null;
+  status: string;
+};
+
+// Dia de calendário em America/Sao_Paulo (vencimentos são datas, não instantes).
+const todaySp = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+
+function dueIso(value: Date | string | null): string | null {
+  if (value === null) return null;
+  return value instanceof Date ? value.toISOString().slice(0, 10) : value.slice(0, 10);
+}
+
+const formatDue = (iso: string) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString('pt-BR', { timeZone: 'UTC' });
+
+// DD/MM/AAAA ou +Nd (relativo ao dia de hoje em America/Sao_Paulo) → YYYY-MM-DD.
+function parseDueInput(input: string): string | null {
+  const absolute = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(input.trim());
+  if (absolute) {
+    const iso = `${absolute[3]}-${absolute[2]}-${absolute[1]}`;
+    const date = new Date(`${iso}T12:00:00Z`);
+    return Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== iso ? null : iso;
+  }
+  const relative = /^\+(\d{1,3})d$/i.exec(input.trim());
+  if (relative) {
+    const base = new Date(`${todaySp()}T12:00:00Z`);
+    base.setUTCDate(base.getUTCDate() + Number(relative[1]));
+    return base.toISOString().slice(0, 10);
+  }
+  return null;
+}
+
+async function findOrderForCharge(tx: Tx, osNumber: number): Promise<ChargeOrderRow | undefined> {
+  const orders = await tx.$queryRawUnsafe<ChargeOrderRow[]>(
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer
+       FROM service_orders AS so JOIN customers AS c ON c.id=so.customer_id
+      WHERE so.number=$1`,
+    osNumber,
+  );
+  return orders[0];
+}
+
+async function findActiveCharge(tx: Tx, orderId: string): Promise<ChargeRow | undefined> {
+  const rows = await tx.$queryRawUnsafe<ChargeRow[]>(
+    `SELECT id, service_order_id, provider, provider_charge_id, method, value_cents, due_date, status
+       FROM charges WHERE service_order_id=$1::uuid AND status IN ('PENDING','OVERDUE')
+      ORDER BY created_at LIMIT 1`,
+    orderId,
+  );
+  return rows[0];
+}
+
+// Validações do 'cobrar' em ordem; retorna a linha da OS apta ou null (já respondendo).
+async function validateChargeTarget(
+  tx: Tx, operatorId: string, sourceMessageId: string, replyTo: string, osNumber: number,
+): Promise<ChargeOrderRow | null> {
+  const order = await findOrderForCharge(tx, osNumber);
+  if (!order) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, 'OS não encontrada.', 'charge-os-missing');
+    return null;
+  }
+  if (order.status !== 'CONFIRMADA') {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `A ${osLabel(order.number)} não está confirmada (status: ${order.status}). Só é possível cobrar OS confirmada.`, 'charge-os-not-confirmed');
+    return null;
+  }
+  if (order.amount_cents === null || order.amount_cents <= 0) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `A ${osLabel(order.number)} não tem valor definido; não é possível cobrar.`, 'charge-os-no-value');
+    return null;
+  }
+  const active = await findActiveCharge(tx, order.id);
+  if (active) {
+    const due = dueIso(active.due_date);
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `Já há cobrança ativa para a ${osLabel(order.number)}: ${active.method} ${formatMoney(active.value_cents)}${due ? ` vence ${formatDue(due)}` : ''} (${active.status}). Use 'cancelar cobrança OS ${order.number}' antes de criar outra.`,
+      'charge-already-active');
+    return null;
+  }
+  return order;
+}
+
+function chargeSummary(payload: ConversationPayload): string {
+  const method = payload.chargeMethod === 'PIX' ? 'Pix' : 'Boleto';
+  return `Cobrança ${method} de ${formatMoney(payload.chargeValueCents ?? null)} para ${payload.chargeCustomerName} (${osLabel(payload.chargeOsNumber ?? 0)}), vencimento ${formatDue(payload.chargeDueDate ?? todaySp())}. Confirma? Responda sim ou cancelar.`;
+}
+
+// Execução do 'sim' em CHARGE_CONFIRM: DRAFT primeiro, provedor depois,
+// reconciliação por external_reference em caso de falha (nunca duplicar).
+async function executeChargeCreation(
+  tx: Tx, message: MessageRow, payload: ConversationPayload, replyTo: string, cfg: Config,
+): Promise<void> {
+  const operatorId = message.operator_id;
+  const provider = getBillingProvider(cfg);
+  if (!provider) {
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      "Cobrança automática não configurada (BILLING_PROVIDER=none). Use 'recebi OS <n> <valor>' para registrar pagamento externo.", 'charge-none');
+    return;
+  }
+  const orderId = payload.chargeOsId;
+  const method = payload.chargeMethod;
+  const dueDate = payload.chargeDueDate;
+  if (!orderId || !method || !dueDate) throw new Error('CHARGE_FIELDS_MISSING');
+  // Revalidação no 'sim': a OS pode ter mudado durante a conversa guiada.
+  const order = await tx.$queryRawUnsafe<ChargeOrderRow[]>(
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.due_date, so.customer_id, so.description, c.name AS customer
+       FROM service_orders AS so JOIN customers AS c ON c.id=so.customer_id WHERE so.id=$1::uuid`,
+    orderId,
+  ).then((rows) => rows[0]);
+  if (!order) throw new Error('ORDER_NOT_FOUND');
+  if (order.status !== 'CONFIRMADA' || order.amount_cents === null || order.amount_cents <= 0) {
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `A ${osLabel(order.number)} não está mais apta para cobrança (status: ${order.status}, valor: ${formatMoney(order.amount_cents)}).`, 'charge-stale');
+    return;
+  }
+  const active = await findActiveCharge(tx, order.id);
+  if (active) {
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `Já há cobrança ativa para a ${osLabel(order.number)} (${active.method} ${formatMoney(active.value_cents)}, ${active.status}). Nada foi criado.`, 'charge-already-active');
+    return;
+  }
+  const seqRows = await tx.$queryRawUnsafe<Array<{ seq: number }>>(
+    'SELECT count(*)::int + 1 AS seq FROM charges WHERE service_order_id=$1::uuid', order.id,
+  );
+  const externalReference = `OS-${order.number}-C${seqRows[0]?.seq ?? 1}`;
+  // Intenção ANTES da chamada: a linha DRAFT com external_reference é a âncora
+  // de reconciliação se a resposta do provedor se perder.
+  const inserted = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `INSERT INTO charges(service_order_id, customer_id, provider, method, value_cents, due_date, status, external_reference)
+     VALUES($1::uuid, $2::uuid, $3, $4, $5, $6::date, 'DRAFT', $7) RETURNING id`,
+    order.id, order.customer_id, provider.name, method, order.amount_cents, dueDate, externalReference,
+  );
+  const chargeId = inserted[0]?.id;
+  if (!chargeId) throw new Error('CHARGE_NOT_CREATED');
+
+  let created: CreatedCharge | null = null;
+  let failureName = 'erro';
+  try {
+    const refs = await tx.$queryRawUnsafe<Array<{ external_id: string }>>(
+      'SELECT external_id FROM customer_provider_refs WHERE customer_id=$1::uuid AND provider=$2',
+      order.customer_id, provider.name,
+    );
+    let externalId = refs[0]?.external_id;
+    if (!externalId) {
+      externalId = await provider.ensureCustomer({ customerId: order.customer_id, name: order.customer });
+      await tx.$executeRawUnsafe(
+        `INSERT INTO customer_provider_refs(customer_id, provider, external_id)
+         VALUES($1::uuid, $2, $3) ON CONFLICT (customer_id, provider) DO NOTHING`,
+        order.customer_id, provider.name, externalId,
+      );
+    }
+    created = await provider.createCharge({
+      providerCustomerId: externalId,
+      method,
+      valueCents: order.amount_cents,
+      dueDate,
+      description: `${osLabel(order.number)} — ${order.description}`,
+      externalReference,
+    });
+  } catch (error) {
+    failureName = error instanceof Error && error.name === 'ProviderTimeoutError' ? 'timeout' : 'erro';
+  }
+  if (!created) {
+    // Timeout/5xx: NUNCA presumir falha — consultar o provedor pela referência
+    // antes de qualquer retry para não duplicar a cobrança.
+    created = await provider.findByExternalReference(externalReference);
+  }
+  if (!created) {
+    await tx.$executeRawUnsafe("UPDATE charges SET status='ERROR', updated_at=now() WHERE id=$1::uuid", chargeId);
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `Falha ao criar a cobrança no provedor (${failureName}) e a reconciliação por ${externalReference} não encontrou cobrança lá. A intenção foi marcada como ERROR; tente novamente.`,
+      'charge-error');
+    return;
+  }
+  await tx.$executeRawUnsafe(
+    'UPDATE charges SET provider_charge_id=$2, status=$3, updated_at=now() WHERE id=$1::uuid',
+    chargeId, created.providerChargeId, created.status,
+  );
+  let pixBlock = '';
+  if (method === 'PIX') {
+    try {
+      const pix = await provider.getPixData(created.providerChargeId);
+      await tx.$executeRawUnsafe(
+        'UPDATE charges SET pix_copy_paste=$2, pix_qr_url=$3 WHERE id=$1::uuid',
+        chargeId, pix.copyPaste, pix.qrImageUrl ?? null,
+      );
+      pixBlock = `\nPix copia-e-cola:\n${pix.copyPaste}`;
+    } catch {
+      // QR indisponível no momento: a cobrança segue PENDING; dados pix podem
+      // ser buscados depois pelo painel do provedor.
+    }
+  }
+  await saveState(tx, operatorId, null, null, null, replyTo);
+  const base = `Cobrança criada: ${osLabel(order.number)} · ${method === 'PIX' ? 'Pix' : 'Boleto'} · ${formatMoney(order.amount_cents)} · vencimento ${formatDue(dueDate)}.`;
+  const extra = method === 'PIX'
+    ? pixBlock
+    : `\nBoleto ${created.providerChargeId}: link disponível no painel Asaas.`;
+  await queueReply(tx, operatorId, message.id, replyTo, `${base}${extra}`, 'charge-created');
+}
+
+// Execução do 'sim' em RECEIPT_CONFIRM: baixa de cobrança ativa OU registro
+// manual (CASH/EXTERNAL_PIX) — nunca rebaixa RECEIVED.
+async function executeReceipt(
+  tx: Tx, message: MessageRow, payload: ConversationPayload, replyTo: string, cfg: Config,
+): Promise<void> {
+  const operatorId = message.operator_id;
+  const orderId = payload.chargeOsId;
+  const osNumber = payload.chargeOsNumber;
+  const cents = payload.receiptCents;
+  const method = payload.receiptMethod;
+  if (!orderId || !osNumber || !cents || !method) throw new Error('RECEIPT_FIELDS_MISSING');
+  const label = method === 'CASH' ? 'dinheiro' : 'pix';
+  const received = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `UPDATE charges SET status='RECEIVED', paid_value_cents=$2, updated_at=now()
+      WHERE service_order_id=$1::uuid AND status IN ('PENDING','OVERDUE') RETURNING id`,
+    orderId, cents,
+  );
+  if (!received[0]) {
+    // Sem cobrança ativa: pagamento externo vira charge do provider 'manual'
+    // (o domínio fala com a porta; o adapter manual nasce RECEIVED).
+    const order = await tx.$queryRawUnsafe<Array<{ customer_id: string }>>(
+      'SELECT customer_id FROM service_orders WHERE id=$1::uuid', orderId,
+    ).then((rows) => rows[0]);
+    if (!order) throw new Error('ORDER_NOT_FOUND');
+    const manual = getBillingProvider({ ...cfg, BILLING_PROVIDER: 'manual' });
+    if (!manual) throw new Error('MANUAL_PROVIDER_UNAVAILABLE');
+    const seqRows = await tx.$queryRawUnsafe<Array<{ seq: number }>>(
+      'SELECT count(*)::int + 1 AS seq FROM charges WHERE service_order_id=$1::uuid', orderId,
+    );
+    const externalReference = `OS-${osNumber}-C${seqRows[0]?.seq ?? 1}`;
+    const created = await manual.createCharge({
+      providerCustomerId: `manual-${order.customer_id}`,
+      method,
+      valueCents: cents,
+      dueDate: todaySp(),
+      description: `${osLabel(osNumber)} — recebimento externo`,
+      externalReference,
+    });
+    await tx.$executeRawUnsafe(
+      `INSERT INTO charges(service_order_id, customer_id, provider, provider_charge_id, method, value_cents, status, external_reference, paid_value_cents)
+       VALUES($1::uuid, $2::uuid, 'manual', $3, $4, $5, 'RECEIVED', $6, $5)`,
+      orderId, order.customer_id, created.providerChargeId, method, cents, externalReference,
+    );
+  }
+  await saveState(tx, operatorId, null, null, null, replyTo);
+  await queueReply(tx, operatorId, message.id, replyTo,
+    `Recebimento registrado: ${osLabel(osNumber)}, ${formatMoney(cents)} (${label}).`, 'receipt-done');
+}
+
+// Execução do 'sim' em CANCEL_CHARGE_CONFIRM.
+async function executeChargeCancel(
+  tx: Tx, message: MessageRow, payload: ConversationPayload, replyTo: string, cfg: Config,
+): Promise<void> {
+  const operatorId = message.operator_id;
+  const chargeDbId = payload.chargeDbId;
+  if (!chargeDbId) throw new Error('CHARGE_ID_MISSING');
+  const rows = await tx.$queryRawUnsafe<Array<ChargeRow & { number: number }>>(
+    `SELECT ch.id, ch.service_order_id, ch.provider, ch.provider_charge_id, ch.method, ch.value_cents, ch.due_date, ch.status, so.number
+       FROM charges AS ch JOIN service_orders AS so ON so.id=ch.service_order_id
+      WHERE ch.id=$1::uuid AND ch.status IN ('PENDING','OVERDUE')`,
+    chargeDbId,
+  );
+  const charge = rows[0];
+  await saveState(tx, operatorId, null, null, null, replyTo);
+  if (!charge) {
+    await queueReply(tx, operatorId, message.id, replyTo, 'A cobrança não está mais ativa; nada foi cancelado.', 'charge-cancel-stale');
+    return;
+  }
+  const provider = getBillingProvider(cfg);
+  if (charge.provider_charge_id && provider && provider.name === charge.provider) {
+    await provider.cancelCharge(charge.provider_charge_id);
+  }
+  await tx.$executeRawUnsafe(
+    "UPDATE charges SET status='CANCELED', updated_at=now() WHERE id=$1::uuid AND status IN ('PENDING','OVERDUE')",
+    charge.id,
+  );
+  await queueReply(tx, operatorId, message.id, replyTo,
+    `Cobrança da ${osLabel(charge.number)} cancelada.`, 'charge-canceled');
+}
+
+// Comandos de cobrança sem pendência ativa (!hasState).
+async function handleBillingCommand(
+  tx: Tx, message: MessageRow, body: string, replyTo: string, cfg: Config,
+): Promise<void> {
+  const operatorId = message.operator_id;
+  const sourceMessageId = message.id;
+
+  if (/^cobran[çc]as$/i.test(body)) {
+    const rows = await tx.$queryRawUnsafe<Array<{ number: number; customer: string; value_cents: number; due_date: Date | string | null; status: string }>>(
+      `SELECT so.number, c.name AS customer, ch.value_cents, ch.due_date, ch.status
+         FROM charges AS ch
+         JOIN service_orders AS so ON so.id=ch.service_order_id
+         JOIN customers AS c ON c.id=ch.customer_id
+        WHERE ch.status IN ('PENDING','OVERDUE')
+        ORDER BY ch.due_date NULLS LAST, so.number`,
+    );
+    const response = rows.length === 0
+      ? 'Nenhuma cobrança aberta.'
+      : `Cobranças abertas:\n${rows.map((row) => {
+        const due = dueIso(row.due_date);
+        return `${osLabel(row.number)} · ${row.customer} · ${formatMoney(row.value_cents)} · vence ${due ? formatDue(due).slice(0, 5) : '—'} · ${row.status}`;
+      }).join('\n')}`;
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, response, 'charges-list');
+    return;
+  }
+
+  if (/^vencidas$/i.test(body)) {
+    const rows = await tx.$queryRawUnsafe<Array<{ number: number; customer: string; value_cents: number; due_date: Date | string | null }>>(
+      `SELECT so.number, c.name AS customer, ch.value_cents, ch.due_date
+         FROM charges AS ch
+         JOIN service_orders AS so ON so.id=ch.service_order_id
+         JOIN customers AS c ON c.id=ch.customer_id
+        WHERE ch.status='OVERDUE'
+        ORDER BY ch.due_date, so.number`,
+    );
+    if (rows.length === 0) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Nenhuma cobrança vencida.', 'charges-overdue-none');
+      return;
+    }
+    const total = rows.reduce((sum, row) => sum + row.value_cents, 0);
+    const header = rows.length === 1
+      ? `1 cobrança vencida, total ${formatMoney(total)}:`
+      : `${rows.length} cobranças vencidas, total ${formatMoney(total)}:`;
+    const lines = rows.map((row) => {
+      const due = dueIso(row.due_date);
+      return `${osLabel(row.number)} · ${row.customer} · ${formatMoney(row.value_cents)} · venceu ${due ? formatDue(due).slice(0, 5) : '—'}`;
+    });
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, `${header}\n${lines.join('\n')}`, 'charges-overdue');
+    return;
+  }
+
+  const recebi = /^recebi\s+OS\s+(\d+)\s+(\S+?)(?:\s+(pix|dinheiro))?$/i.exec(body);
+  if (recebi) {
+    const osNumber = Number(recebi[1]);
+    const cents = parseMoney(recebi[2]!);
+    if (cents === null || cents <= 0) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Valor inválido. Use, por exemplo, 150 ou 150,00.', 'receipt-bad-money');
+      return;
+    }
+    const order = await findOrderForCharge(tx, osNumber);
+    if (!order) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo, 'OS não encontrada.', 'receipt-os-missing');
+      return;
+    }
+    const method: 'CASH' | 'EXTERNAL_PIX' = recebi[3]?.toLowerCase() === 'pix' ? 'EXTERNAL_PIX' : 'CASH';
+    const label = method === 'CASH' ? 'dinheiro' : 'pix';
+    await saveState(tx, operatorId, 'RECEIPT_CONFIRM', {
+      chargeOsId: order.id, chargeOsNumber: order.number, receiptCents: cents, receiptMethod: method,
+    }, null, replyTo);
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `Registrar recebimento de ${formatMoney(cents)} da ${osLabel(order.number)} (${label})? Responda sim ou cancelar.`, 'receipt-confirm');
+    return;
+  }
+  if (/^recebi\b/i.test(body)) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Use: recebi OS <número> <valor> [pix|dinheiro]. Ex.: recebi OS 3 150,00 pix.', 'receipt-usage');
+    return;
+  }
+
+  const cancelCharge = /^cancelar\s+cobran[çc]a\s+OS\s+(\d+)$/i.exec(body);
+  if (cancelCharge) {
+    const osNumber = Number(cancelCharge[1]);
+    const order = await findOrderForCharge(tx, osNumber);
+    if (!order) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo, 'OS não encontrada.', 'charge-cancel-os-missing');
+      return;
+    }
+    const active = await findActiveCharge(tx, order.id);
+    if (!active) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo,
+        `Não há cobrança ativa (PENDING ou OVERDUE) para a ${osLabel(order.number)}.`, 'charge-cancel-none');
+      return;
+    }
+    await saveState(tx, operatorId, 'CANCEL_CHARGE_CONFIRM', {
+      chargeDbId: active.id, chargeOsId: order.id, chargeOsNumber: order.number,
+    }, null, replyTo);
+    await queueReply(tx, operatorId, sourceMessageId, replyTo,
+      `Cancelar a cobrança ${active.method} de ${formatMoney(active.value_cents)} da ${osLabel(order.number)}? Responda sim ou cancelar.`, 'charge-cancel-confirm');
+    return;
+  }
+
+  const cobrar = /^cobrar\s+OS\s+(\d+)(?:\s+(pix|boleto))?(?:\s+(\d{2}\/\d{2}\/\d{4}|\+\d{1,3}d))?$/i.exec(body);
+  if (cobrar) {
+    if (!getBillingProvider(cfg)) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo,
+        "Cobrança automática não configurada (BILLING_PROVIDER=none). Use 'recebi OS <n> <valor>' para registrar pagamento externo.", 'charge-none');
+      return;
+    }
+    const order = await validateChargeTarget(tx, operatorId, sourceMessageId, replyTo, Number(cobrar[1]));
+    if (!order) return;
+    const defaultDue = dueIso(order.due_date) ?? todaySp();
+    const basePayload: ConversationPayload = {
+      chargeOsId: order.id,
+      chargeOsNumber: order.number,
+      chargeCustomerName: order.customer,
+      chargeValueCents: order.amount_cents ?? undefined,
+      chargeDueDate: defaultDue,
+    };
+    const method = cobrar[2]?.toLowerCase() === 'pix' ? 'PIX' as const : cobrar[2]?.toLowerCase() === 'boleto' ? 'BOLETO' as const : undefined;
+    if (!method) {
+      await saveState(tx, operatorId, 'CHARGE_METHOD', basePayload, null, replyTo);
+      await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Método da cobrança? Responda pix ou boleto.', 'charge-ask-method');
+      return;
+    }
+    const withMethod = { ...basePayload, chargeMethod: method };
+    const dueInput = cobrar[3];
+    if (!dueInput) {
+      await saveState(tx, operatorId, 'CHARGE_DUE', withMethod, null, replyTo);
+      await queueReply(tx, operatorId, sourceMessageId, replyTo,
+        `Vencimento? Responda DD/MM/AAAA, +Nd ou - para usar ${formatDue(defaultDue)}.`, 'charge-ask-due');
+      return;
+    }
+    const dueDate = parseDueInput(dueInput);
+    if (!dueDate) {
+      await queueReply(tx, operatorId, sourceMessageId, replyTo,
+        `Data inválida. Use DD/MM/AAAA ou +Nd (ex.: 10/11/2026, +7d).`, 'charge-bad-due');
+      return;
+    }
+    const finalPayload = { ...withMethod, chargeDueDate: dueDate };
+    await saveState(tx, operatorId, 'CHARGE_CONFIRM', finalPayload, null, replyTo);
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, chargeSummary(finalPayload), 'charge-confirm');
+    return;
+  }
+  if (/^cobrar\b/i.test(body)) {
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Use: cobrar OS <número> [pix|boleto] [DD/MM/AAAA | +Nd]. Ex.: cobrar OS 3 pix +7d.', 'charge-usage');
+    return;
+  }
+
+  await queueReply(tx, operatorId, sourceMessageId, replyTo,
+    "Comandos de cobrança: 'cobrar OS 3 pix +7d', 'cobranças', 'vencidas', 'recebi OS 3 150,00 pix', 'cancelar cobrança OS 3'.", 'billing-help');
+}
+
+// Steps guiados da cobrança (CHARGE_METHOD → CHARGE_DUE → CHARGE_CONFIRM) e
+// confirmações de recebimento/cancelamento. Retorna true quando tratou.
+async function handleBillingStep(
+  tx: Tx, message: MessageRow, payload: ConversationPayload, body: string, replyTo: string, cfg: Config,
+): Promise<boolean> {
+  if (message.pending_action === 'CHARGE_METHOD') {
+    const method = /^pix$/i.test(body) ? 'PIX' as const : /^boleto$/i.test(body) ? 'BOLETO' as const : null;
+    if (!method) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Responda pix ou boleto.', 'charge-method-invalid');
+      return true;
+    }
+    const next = { ...payload, chargeMethod: method };
+    await saveState(tx, message.operator_id, 'CHARGE_DUE', next, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Vencimento? Responda DD/MM/AAAA, +Nd ou - para usar ${formatDue(payload.chargeDueDate ?? todaySp())}.`, 'charge-ask-due');
+    return true;
+  }
+  if (message.pending_action === 'CHARGE_DUE') {
+    const fallback = payload.chargeDueDate ?? todaySp();
+    const dueDate = body.trim() === '-' ? fallback : parseDueInput(body);
+    if (!dueDate) {
+      await queueReply(tx, message.operator_id, message.id, replyTo,
+        `Data inválida. Use DD/MM/AAAA, +Nd ou - para usar ${formatDue(fallback)}.`, 'charge-due-invalid');
+      return true;
+    }
+    const next = { ...payload, chargeDueDate: dueDate };
+    await saveState(tx, message.operator_id, 'CHARGE_CONFIRM', next, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo, chargeSummary(next), 'charge-confirm');
+    return true;
+  }
+  if (message.pending_action === 'CHARGE_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Operação cancelada.', 'charge-cancel');
+      return true;
+    }
+    await executeChargeCreation(tx, message, payload, replyTo, cfg);
+    return true;
+  }
+  if (message.pending_action === 'RECEIPT_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Operação cancelada.', 'receipt-cancel');
+      return true;
+    }
+    await executeReceipt(tx, message, payload, replyTo, cfg);
+    return true;
+  }
+  if (message.pending_action === 'CANCEL_CHARGE_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Operação cancelada.', 'charge-cancel-abort');
+      return true;
+    }
+    await executeChargeCancel(tx, message, payload, replyTo, cfg);
+    return true;
+  }
+  return false;
+}
+
 export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Promise<void> {
   const messages = await tx.$queryRawUnsafe<MessageRow[]>(
     `SELECT m.id, m.message_id, m.operator_id, m.reply_to, m.body, m.has_media,
@@ -1050,6 +1636,10 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
   }
   if (!hasState && /^(saldo|entrada|ajustar|devolver|estoque)\b/i.test(body)) {
     await handleStockCommand(tx, message, body, replyTo);
+    return;
+  }
+  if (!hasState && /^(cobrar|cobran[çc]as|vencidas|recebi|cancelar\s+cobran[çc]a)\b/i.test(body)) {
+    await handleBillingCommand(tx, message, body, replyTo, cfg);
     return;
   }
   if (!hasState && await processQuery(tx, message.operator_id, message.id, replyTo, body)) return;
@@ -1279,5 +1869,6 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
     await queueReply(tx, message.operator_id, message.id, replyTo, await confirmationReceipt(tx, orderId), 'confirm');
     return;
   }
+  if (await handleBillingStep(tx, message, payload, body, replyTo, cfg)) return;
   throw new Error(`UNKNOWN_PENDING_ACTION:${message.pending_action}`);
 }

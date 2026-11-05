@@ -29,6 +29,7 @@ model Customer {
   normalizedName String @map("normalized_name")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   orders ServiceOrder[]
+  providerRefs CustomerProviderRef[]
   @@index([normalizedName])
   @@map("customers")
 }
@@ -148,6 +149,66 @@ model ServiceOrderItem {
   createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
   @@index([serviceOrderId])
   @@map("service_order_items")
+}
+
+model CustomerProviderRef {
+  customerId String @map("customer_id") @db.Uuid
+  customer Customer @relation(fields: [customerId], references: [id])
+  provider String
+  externalId String @map("external_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@id([customerId, provider])
+  @@unique([provider, externalId])
+  @@map("customer_provider_refs")
+}
+
+model Charge {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  serviceOrderId String @map("service_order_id") @db.Uuid
+  customerId String @map("customer_id") @db.Uuid
+  provider String
+  providerChargeId String? @map("provider_charge_id")
+  method String
+  valueCents Int @map("value_cents")
+  dueDate DateTime? @map("due_date") @db.Date
+  status String @default("DRAFT")
+  externalReference String @unique @map("external_reference")
+  pixCopyPaste String? @map("pix_copy_paste")
+  pixQrUrl String? @map("pix_qr_url")
+  paidValueCents Int? @map("paid_value_cents")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  @@index([serviceOrderId])
+  @@map("charges")
+}
+
+model BillingEvent {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  provider String
+  providerEventId String @map("provider_event_id")
+  chargeId String? @map("charge_id") @db.Uuid
+  eventType String @map("event_type")
+  payload Json
+  processed Boolean @default(false)
+  receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+  position BigInt @unique @default(autoincrement())
+  @@unique([provider, providerEventId])
+  @@map("billing_events")
+}
+
+model Invoice {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  serviceOrderId String @map("service_order_id") @db.Uuid
+  provider String
+  providerInvoiceId String? @map("provider_invoice_id")
+  status String @default("NOT_REQUESTED")
+  payload Json?
+  lastError String? @map("last_error")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  @@index([serviceOrderId])
+  @@map("invoices")
 }
 
 model StockMovement {
