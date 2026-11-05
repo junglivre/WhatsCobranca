@@ -33,6 +33,11 @@ services:
       GROQ_STT_MODEL: ${GROQ_STT_MODEL:-whisper-large-v3}
       GROQ_LLM_MODEL: ${GROQ_LLM_MODEL:-llama-3.3-70b-versatile}
       WAHA_MEDIA_MAX_BYTES: ${WAHA_MEDIA_MAX_BYTES:-16777216}
+      BILLING_PROVIDER: ${BILLING_PROVIDER:-none}
+      ASAAS_API_KEY: ${ASAAS_API_KEY:-}
+      ASAAS_BASE_URL: ${ASAAS_BASE_URL:-https://api-sandbox.asaas.com/v3}
+      ASAAS_WEBHOOK_TOKEN: ${ASAAS_WEBHOOK_TOKEN:-}
+      INVOICE_PROVIDER: ${INVOICE_PROVIDER:-none}
     ports: ["127.0.0.1:8080:8080"]
     depends_on: {postgres: {condition: service_healthy}}
     healthcheck:
