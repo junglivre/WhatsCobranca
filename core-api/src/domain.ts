@@ -1308,9 +1308,14 @@ async function executeChargeCreation(
         chargeId, pix.copyPaste, pix.qrImageUrl ?? null,
       );
       pixBlock = `\nPix copia-e-cola:\n${pix.copyPaste}`;
-    } catch {
+    } catch (error) {
       // QR indisponível no momento: a cobrança segue PENDING; dados pix podem
-      // ser buscados depois pelo painel do provedor.
+      // ser buscados depois pelo painel do provedor. Nunca silencioso: o
+      // operador precisa conseguir diagnosticar pelo log do container.
+      console.error(
+        `[billing] getPixData falhou para ${created.providerChargeId}:`,
+        error instanceof Error ? `${error.name}: ${error.message}` : error,
+      );
     }
   }
   await saveState(tx, operatorId, null, null, null, replyTo);
