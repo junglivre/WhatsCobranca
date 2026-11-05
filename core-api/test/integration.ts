@@ -603,6 +603,19 @@ async function charges(): Promise<ChargeRow[]> {
        FROM charges ORDER BY created_at, id`,
   );
 }
+
+// ===== Helpers Fase 7 (emissão fiscal) =====
+type InvoiceRow = {
+  id: string; service_order_id: string; provider: string; provider_invoice_id: string | null;
+  status: string; payload: Record<string, unknown> | null; last_error: string | null;
+};
+async function invoices(): Promise<InvoiceRow[]> {
+  return prisma.$queryRawUnsafe<InvoiceRow[]>(
+    `SELECT id::text AS id, service_order_id::text AS service_order_id, provider,
+            provider_invoice_id, status, payload, last_error
+       FROM invoices ORDER BY created_at, id`,
+  );
+}
 type BillingEventRow = { provider: string; provider_event_id: string; event_type: string; charge_id: string | null; processed: boolean };
 async function billingEvents(): Promise<BillingEventRow[]> {
   return prisma.$queryRawUnsafe<BillingEventRow[]>(
@@ -2260,6 +2273,84 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.match((await inbound('cpf Ninguem Aqui 52998224725')).text, /Não encontrei cliente com esse nome: Ninguem Aqui\./);
     assert.match((await inbound('cpf')).text, /Use: cpf <nome do cliente> <documento>/);
     await pending(null);
+  }],
+  ['emitir NF pelo adapter manual registra NEEDS_REVIEW, exige CPF/CNPJ e deduplica solicitação', async () => {
+    await restartAppWith({ INVOICE_PROVIDER: 'manual' });
+    const order = await confirmOrder('Servico com nota', 'Cliente Nota', '150');
+    // Sem CPF/CNPJ: a solicitação só é recusada depois do 'sim' (nada persistido).
+    const first = await inbound(`emitir NF OS ${order.number} 1.02`);
+    assert.match(first.text, /Solicitar emissão fiscal da OS 000001 para Cliente Nota, R\$ 150,00, código 1\.02\? Responda sim ou cancelar\./);
+    await pending('INVOICE_CONFIRM');
+    const missing = await inbound('sim');
+    await pending(null);
+    assert.match(missing.text, /A emissão exige CPF\/CNPJ do tomador\. Informe com: cpf Cliente Nota <número>\./);
+    assert.equal((await invoices()).length, 0);
+    // Abortar antes do 'sim' não cria nada.
+    const asked = await inbound(`emitir NF OS ${order.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    assert.match((await inbound('cancelar')).text, /Operação cancelada\./);
+    await pending(null);
+    assert.equal((await invoices()).length, 0);
+    // Documento informado: solicitação registrada como pendência humana.
+    await inbound('cpf Cliente Nota 52998224725');
+    const confirm = await inbound(`emitir NF OS ${order.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Solicitação fiscal da OS 000001 registrada para emissão humana \(referência OS-1-NF1\)\./);
+    const rows = await invoices();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.provider, 'manual');
+    assert.equal(rows[0]!.status, 'NEEDS_REVIEW');
+    assert.equal(rows[0]!.provider_invoice_id, null);
+    assert.equal(rows[0]!.payload!.externalReference, 'OS-1-NF1');
+    assert.equal(rows[0]!.payload!.serviceCode, '1.02');
+    assert.equal(rows[0]!.payload!.valueCents, 15000);
+    assert.equal((rows[0]!.payload!.customer as Record<string, unknown>).cpfCnpj, '52998224725');
+    assert.deepEqual((await audits(done.id)).map((entry) => [entry.entity_type, entry.action, entry.previous_status, entry.new_status]),
+      [['invoice', 'REQUEST_INVOICE', 'READY_FOR_APPROVAL', 'NEEDS_REVIEW']]);
+    // Deduplicação: solicitação ativa bloqueia nova emissão.
+    const dup = await inbound(`emitir NF OS ${order.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    const dupDone = await inbound('sim');
+    await pending(null);
+    assert.match(dupDone.text, /Já há solicitação fiscal da OS 000001 no estado NEEDS_REVIEW\./);
+    assert.equal((await invoices()).length, 1);
+    void dup;
+    // Uso incorreto e OS inexistente: respostas determinísticas.
+    assert.match((await inbound('emitir NF OS 99 1.02')).text, /OS não encontrada\./);
+    assert.match((await inbound('emitir NF OS 1')).text, /Use: emitir NF OS <número> <código-do-serviço>\./);
+    await pending(null);
+    // Listagem só existe enquanto pendente.
+    const list = await inbound('notas');
+    assert.match(list.text, /Solicitações fiscais:\nOS 000001 · Cliente Nota · NEEDS_REVIEW · manual/);
+  }],
+  ['emissor none e OS inválidas respondem determinístico sem persistir nota', async () => {
+    // INVOICE_PROVIDER=none (padrão): comando responde sem criar nada.
+    const order = await confirmOrder('Servico sem nota', 'Cliente Sem Nota', '150');
+    const none = await inbound(`emitir NF OS ${order.number} 14.01`);
+    assert.match(none.text, /Emissão fiscal automática não configurada \(INVOICE_PROVIDER=none\)\./);
+    await pending(null);
+    assert.equal((await invoices()).length, 0);
+    // OS não confirmada e sem valor: rejeitadas antes da confirmação.
+    const pendingCustomerId = await seedCustomer('Cliente Nota Pendente');
+    await prisma.$executeRawUnsafe(
+      "INSERT INTO service_orders(customer_id, description, status) VALUES($1::uuid, 'Servico nota pendente', 'AGUARDANDO_DADOS')",
+      pendingCustomerId,
+    );
+    await restartAppWith({ INVOICE_PROVIDER: 'manual' });
+    const unconfirmed = await inbound('emitir NF OS 2 1.02');
+    assert.match(unconfirmed.text, /A OS 000002 não está confirmada ou não tem valor para emissão fiscal\./);
+    await pending(null);
+    assert.equal((await invoices()).length, 0);
+    await seedOrder('Servico nota sem valor', 'Cliente Nota Sem Valor'); // OS 3, CONFIRMADA, amount null
+    const noValue = await inbound('emitir NF OS 3 1.02');
+    assert.match(noValue.text, /A OS 000003 não está confirmada ou não tem valor para emissão fiscal\./);
+    await pending(null);
+    // Lista vazia funciona mesmo sem provedor.
+    delete process.env.INVOICE_PROVIDER;
+    await restartAppWith({});
+    assert.match((await inbound('notas')).text, /Nenhuma solicitação fiscal pendente\./);
   }],
 ];
 

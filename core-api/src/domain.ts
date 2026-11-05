@@ -3,9 +3,10 @@ import type { JsonRecord, Tx } from './types.js';
 import { formatMoney, formatQty, isNo, isYes, normalize, osLabel, parseMoney, parseQuantity } from './types.js';
 import { downloadWahaMedia, MediaFailure } from './waha.js';
 import { extractServiceIntent, GroqFailure, transcribeAudio, type Extraction } from './groq.js';
-import { getBillingProvider } from './providers/registry.js';
+import { getBillingProvider, getInvoiceProvider } from './providers/registry.js';
 import { MissingFiscalIdError } from './providers/billing/types.js';
 import type { CreatedCharge } from './providers/billing/types.js';
+import type { InvoiceRequestResult } from './providers/invoices/types.js';
 
 type Purpose = 'CREATE' | 'QUERY' | 'MATERIAL';
 type CustomerRow = { id: string; name: string };
@@ -80,6 +81,9 @@ type ConversationPayload = {
   chargeSendTo?: string;
   chargeSendBody?: string;
   chargeSendId?: string;
+  invoiceOrderId?: string;
+  invoiceOsNumber?: number;
+  invoiceServiceCode?: string;
   // Comando `cpf <nome> <documento>` com nome ambíguo: o documento já
   // validado viaja no payload enquanto o operador escolhe o cliente.
   cpfDoc?: string;
@@ -241,6 +245,13 @@ function payloadOf(value: unknown): ConversationPayload {
     chargeSendTo: typeof record.chargeSendTo === 'string' && /^\d{10,13}@c\.us$/.test(record.chargeSendTo) ? record.chargeSendTo : undefined,
     chargeSendBody: typeof record.chargeSendBody === 'string' && record.chargeSendBody.length > 0 ? record.chargeSendBody : undefined,
     chargeSendId: typeof record.chargeSendId === 'string' && record.chargeSendId.length > 0 ? record.chargeSendId : undefined,
+    invoiceOrderId: typeof record.invoiceOrderId === 'string' && record.invoiceOrderId.length > 0 ? record.invoiceOrderId : undefined,
+    invoiceOsNumber: typeof record.invoiceOsNumber === 'number' && Number.isSafeInteger(record.invoiceOsNumber) && record.invoiceOsNumber > 0
+      ? record.invoiceOsNumber
+      : undefined,
+    invoiceServiceCode: typeof record.invoiceServiceCode === 'string' && /^[A-Za-z0-9.-]{1,64}$/.test(record.invoiceServiceCode)
+      ? record.invoiceServiceCode
+      : undefined,
   };
 }
 
@@ -1139,6 +1150,191 @@ async function confirmMaterialOperation(
   await queueReply(tx, operatorId, sourceMessageId, replyTo, replyBody, suffix);
 }
 
+// ===== Emissão fiscal (Fase 7) =====
+//
+// A conversa fala exclusivamente com InvoiceProvider. O adapter manual
+// transforma a solicitação em NEEDS_REVIEW para emissão humana; adapters de
+// Portal Nacional ou terceiros mantêm a mesma intenção persistida e a mesma
+// reconciliação por externalReference.
+type InvoiceOrderRow = {
+  id: string;
+  number: number;
+  status: string;
+  amount_cents: number | null;
+  description: string;
+  customer: string;
+  cpf_cnpj: string | null;
+  email: string | null;
+  address_street: string | null;
+  address_number: string | null;
+  address_district: string | null;
+  address_city: string | null;
+  address_state: string | null;
+  address_zip: string | null;
+};
+
+async function findOrderForInvoice(tx: Tx, number: number): Promise<InvoiceOrderRow | undefined> {
+  return tx.$queryRawUnsafe<InvoiceOrderRow[]>(
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.description, c.name AS customer,
+            c.cpf_cnpj, c.email, c.address_street, c.address_number, c.address_district,
+            c.address_city, c.address_state, c.address_zip
+       FROM service_orders so JOIN customers c ON c.id=so.customer_id
+      WHERE so.number=$1`,
+    number,
+  ).then((rows) => rows[0]);
+}
+
+async function executeInvoiceRequest(
+  tx: Tx, message: MessageRow, payload: ConversationPayload, replyTo: string, cfg: Config,
+): Promise<void> {
+  const provider = getInvoiceProvider(cfg);
+  const orderId = payload.invoiceOrderId;
+  const serviceCode = payload.invoiceServiceCode;
+  if (!orderId || !serviceCode) throw new Error('INVOICE_FIELDS_MISSING');
+  if (!provider) {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      "Emissão fiscal automática não configurada (INVOICE_PROVIDER=none).", 'invoice-none');
+    return;
+  }
+  const order = await tx.$queryRawUnsafe<InvoiceOrderRow[]>(
+    `SELECT so.id, so.number, so.status, so.amount_cents, so.description, c.name AS customer,
+            c.cpf_cnpj, c.email, c.address_street, c.address_number, c.address_district,
+            c.address_city, c.address_state, c.address_zip
+       FROM service_orders so JOIN customers c ON c.id=so.customer_id
+      WHERE so.id=$1::uuid`,
+    orderId,
+  ).then((rows) => rows[0]);
+  if (!order) throw new Error('ORDER_NOT_FOUND');
+  if (order.status !== 'CONFIRMADA' || !order.amount_cents || order.amount_cents <= 0) {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A ${osLabel(order.number)} não está mais apta para emissão fiscal (status: ${order.status}, valor: ${formatMoney(order.amount_cents)}).`, 'invoice-stale');
+    return;
+  }
+  if (!order.cpf_cnpj) {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A emissão exige CPF/CNPJ do tomador. Informe com: cpf ${order.customer} <número>.`, 'invoice-fiscal-id');
+    return;
+  }
+  const existing = await tx.$queryRawUnsafe<Array<{ status: string }>>(
+    `SELECT status FROM invoices
+      WHERE service_order_id=$1::uuid AND provider=$2 AND status NOT IN ('CANCELED','REJECTED')
+      ORDER BY created_at DESC LIMIT 1`,
+    order.id, provider.name,
+  );
+  if (existing[0]) {
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Já há solicitação fiscal da ${osLabel(order.number)} no estado ${existing[0].status}.`, 'invoice-already-requested');
+    return;
+  }
+  const sequence = await tx.$queryRawUnsafe<Array<{ seq: number }>>(
+    'SELECT count(*)::int + 1 AS seq FROM invoices WHERE service_order_id=$1::uuid',
+    order.id,
+  );
+  const externalReference = `OS-${order.number}-NF${sequence[0]?.seq ?? 1}`;
+  const input = {
+    serviceOrderNumber: order.number,
+    externalReference,
+    customer: {
+      name: order.customer,
+      cpfCnpj: order.cpf_cnpj,
+      email: order.email,
+      address: {
+        street: order.address_street, number: order.address_number, district: order.address_district,
+        city: order.address_city, state: order.address_state, zip: order.address_zip,
+      },
+    },
+    serviceCode,
+    valueCents: order.amount_cents,
+    description: order.description,
+  };
+  const created = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `INSERT INTO invoices(service_order_id, provider, status, payload)
+     VALUES($1::uuid, $2, 'READY_FOR_APPROVAL', $3::jsonb) RETURNING id`,
+    order.id, provider.name, JSON.stringify(input),
+  );
+  const invoiceId = created[0]?.id;
+  if (!invoiceId) throw new Error('INVOICE_NOT_CREATED');
+  let result: InvoiceRequestResult | null | undefined;
+  let failure = '';
+  try {
+    result = await provider.request(input);
+  } catch (error) {
+    failure = error instanceof Error ? error.message : 'erro desconhecido';
+    result = await provider.findByExternalReference(externalReference);
+  }
+  if (!result) {
+    await tx.$executeRawUnsafe(
+      "UPDATE invoices SET status='NEEDS_REVIEW', last_error=$2, updated_at=now() WHERE id=$1::uuid",
+      invoiceId, `reconciliação pendente: ${failure || 'sem confirmação do emissor'}`,
+    );
+    await audit(tx, message.operator_id, message.id, 'invoice', invoiceId, 'REQUEST_INVOICE_REVIEW', 'READY_FOR_APPROVAL', 'NEEDS_REVIEW', externalReference);
+    await saveState(tx, message.operator_id, null, null, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A solicitação fiscal da ${osLabel(order.number)} ficou em revisão; não reenvie antes de conferir o emissor.`, 'invoice-needs-review');
+    return;
+  }
+  await tx.$executeRawUnsafe(
+    'UPDATE invoices SET provider_invoice_id=$2, status=$3, updated_at=now() WHERE id=$1::uuid',
+    invoiceId, result.providerInvoiceId, result.status,
+  );
+  await audit(tx, message.operator_id, message.id, 'invoice', invoiceId, 'REQUEST_INVOICE', 'READY_FOR_APPROVAL', result.status, externalReference);
+  await saveState(tx, message.operator_id, null, null, null, replyTo);
+  const text = result.status === 'NEEDS_REVIEW'
+    ? `Solicitação fiscal da ${osLabel(order.number)} registrada para emissão humana (referência ${externalReference}).`
+    : `Solicitação fiscal da ${osLabel(order.number)} enviada ao emissor (status: ${result.status}).`;
+  await queueReply(tx, message.operator_id, message.id, replyTo, text, 'invoice-requested');
+}
+
+async function handleInvoiceCommand(
+  tx: Tx, message: MessageRow, body: string, replyTo: string, cfg: Config,
+): Promise<void> {
+  if (/^notas$/i.test(body)) {
+    const rows = await tx.$queryRawUnsafe<Array<{ number: number; customer: string; status: string; provider: string }>>(
+      `SELECT so.number, c.name AS customer, i.status, i.provider
+         FROM invoices i JOIN service_orders so ON so.id=i.service_order_id
+         JOIN customers c ON c.id=so.customer_id
+        WHERE i.status NOT IN ('AUTHORIZED','CANCELED')
+        ORDER BY i.created_at DESC LIMIT 10`,
+    );
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      rows.length === 0 ? 'Nenhuma solicitação fiscal pendente.'
+        : `Solicitações fiscais:\n${rows.map((row) => `${osLabel(row.number)} · ${row.customer} · ${row.status} · ${row.provider}`).join('\n')}`,
+      rows.length === 0 ? 'invoices-none' : 'invoices-list');
+    return;
+  }
+  const issue = /^emitir\s+(?:NF|NFS-?e)\s+OS\s+(\d+)\s+([A-Za-z0-9.-]{1,64})$/i.exec(body);
+  if (!issue) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      'Use: emitir NF OS <número> <código-do-serviço>. Ex.: emitir NF OS 3 1.02.', 'invoice-usage');
+    return;
+  }
+  if (!getInvoiceProvider(cfg)) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      "Emissão fiscal automática não configurada (INVOICE_PROVIDER=none).", 'invoice-none');
+    return;
+  }
+  const order = await findOrderForInvoice(tx, Number(issue[1]));
+  if (!order) {
+    await queueReply(tx, message.operator_id, message.id, replyTo, 'OS não encontrada.', 'invoice-os-missing');
+    return;
+  }
+  if (order.status !== 'CONFIRMADA' || !order.amount_cents || order.amount_cents <= 0) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `A ${osLabel(order.number)} não está confirmada ou não tem valor para emissão fiscal.`, 'invoice-os-invalid');
+    return;
+  }
+  await saveState(tx, message.operator_id, 'INVOICE_CONFIRM', {
+    invoiceOrderId: order.id, invoiceOsNumber: order.number, invoiceServiceCode: issue[2]!,
+  }, null, replyTo);
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Solicitar emissão fiscal da ${osLabel(order.number)} para ${order.customer}, ${formatMoney(order.amount_cents)}, código ${issue[2]}? Responda sim ou cancelar.`,
+    'invoice-confirm');
+}
+
 // ===== Cobrança (Fase 6) =====
 //
 // Gramática determinística (o domínio fala SÓ com a porta BillingProvider +
@@ -2002,6 +2198,15 @@ async function handleBillingCommand(
 async function handleBillingStep(
   tx: Tx, message: MessageRow, payload: ConversationPayload, body: string, replyTo: string, cfg: Config,
 ): Promise<boolean> {
+  if (message.pending_action === 'INVOICE_CONFIRM') {
+    if (!isYes(body)) {
+      await saveState(tx, message.operator_id, null, null, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Operação cancelada.', 'invoice-abort');
+      return true;
+    }
+    await executeInvoiceRequest(tx, message, payload, replyTo, cfg);
+    return true;
+  }
   if (message.pending_action === 'CUSTOMER_UPDATE_CHOOSE') {
     const choice = Number(body);
     const candidate = Number.isInteger(choice) ? payload.candidates?.[choice - 1] : undefined;
@@ -2153,6 +2358,10 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
   }
   if (!hasState && await handleCustomerCommand(tx, message, body, replyTo)) return;
   if (!hasState && await handleOrderLifecycleCommand(tx, message, body, replyTo)) return;
+  if (!hasState && /^(emitir\s+NF|notas)\b/i.test(body)) {
+    await handleInvoiceCommand(tx, message, body, replyTo, cfg);
+    return;
+  }
   if (!hasState && /^(cobrar|cobran[çc]as|vencidas|recebi|cancelar\s+cobran[çc]a|cpf)\b/i.test(body)) {
     await handleBillingCommand(tx, message, body, replyTo, cfg);
     return;

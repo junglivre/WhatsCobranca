@@ -177,7 +177,20 @@ Depois de criar um Pix, o bot só pergunta se deve enviar a cobrança ao cliente
 
 **Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
 
-**Limitações desta fase:** boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); NFS-e tem porta+tabela mas nenhum fluxo de conversa (Fase 7); custo médio de material segue fora.
+**Limitações desta fase:** boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); custo médio de material segue fora.
+
+## Emissão fiscal (Fase 7)
+
+A porta `InvoiceProvider` (`core-api/src/providers/invoices/types.ts`) ganhou fluxo de conversa. Seleção por env: `INVOICE_PROVIDER=none|manual` (`none` é o padrão — comandos respondem determinístico sem criar nada).
+
+**Comandos do operador:**
+
+- `emitir NF OS <n> <código-do-serviço>` — resumo → confirmação → solicitação persistida antes de falar com o emissor (estados `READY_FOR_APPROVAL` → resultado do adapter). O código de serviço é informado pelo operador (parametrizado, nunca fixado em código).
+- `notas` — solicitações não concluídas (tudo exceto `AUTHORIZED`/`CANCELED`), mais recentes primeiro.
+
+**Regras:** só OS `CONFIRMADA` com valor; exige CPF/CNPJ do tomador (orienta `cpf <nome> <documento>`); uma solicitação ativa por OS/provedor bloqueia nova emissão até `CANCELED`/`REJECTED`; falha de comunicação NUNCA presume perda — o adapter consulta `findByExternalReference` (âncora `OS-<n>-NF<seq>`) e, sem confirmação, a solicitação fica `NEEDS_REVIEW` com `last_error` para conferência manual no emissor.
+
+**Adapter `manual`:** nenhum emissor externo; toda solicitação vira `NEEDS_REVIEW` para emissão humana no Portal Nacional. É a referência para plugares Asaas NFS-e ou Portal Nacional direto: implemente a interface (agora com `findByExternalReference`), registre no `registry.ts` e no enum do `config.ts`.
 
 ## Verificação isolada
 

@@ -32,6 +32,9 @@ export interface InvoiceCustomerInput {
 
 export interface InvoiceRequestInput {
   serviceOrderNumber: number;
+  /** Referência determinística persistida antes da chamada; permite
+   * reconciliação depois de timeout sem emitir a mesma nota duas vezes. */
+  externalReference: string;
   customer: InvoiceCustomerInput;
   /** Código de serviço municipal/nacional APROVADO previamente (parametrizado,
    *  nunca fixado em código — ver Regra 8.9 do plano: IBS/CBS 2027). */
@@ -61,6 +64,12 @@ export interface InvoiceProvider {
    * antes de qualquer nova tentativa.
    */
   getStatus(providerInvoiceId: string): Promise<InvoiceStatus>;
+
+  /**
+   * Localiza a solicitação por referência persistida após timeout/5xx.
+   * Retorna null somente quando o emissor confirma que nada foi criado.
+   */
+  findByExternalReference(externalReference: string): Promise<InvoiceRequestResult | null>;
 
   cancel(providerInvoiceId: string): Promise<void>;
 }

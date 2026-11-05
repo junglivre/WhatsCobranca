@@ -21,6 +21,10 @@ export class ManualInvoiceProvider implements InvoiceProvider {
     return 'NEEDS_REVIEW';
   }
 
+  async findByExternalReference(_externalReference: string): Promise<InvoiceRequestResult | null> {
+    return null;
+  }
+
   /** Sem emissor externo, cancelar é no-op (o banco marca CANCELED). */
   async cancel(_providerInvoiceId: string): Promise<void> {}
 }
