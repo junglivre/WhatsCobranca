@@ -1654,8 +1654,8 @@ async function customerProfile(tx: Tx, message: MessageRow, replyTo: string, nam
   ))[0];
   if (!customer) throw new Error('CUSTOMER_NOT_FOUND');
   const totals = (await tx.$queryRawUnsafe<Array<{ orders: bigint; charged: bigint; received: bigint }>>(
-    `SELECT COUNT(so.id) AS orders,
-            COALESCE(SUM(ch.value_cents) FILTER (WHERE ch.status <> 'CANCELED'), 0) AS charged,
+    `SELECT COUNT(DISTINCT so.id) AS orders,
+            COALESCE(SUM(ch.value_cents) FILTER (WHERE ch.status NOT IN ('CANCELED', 'ERROR')), 0) AS charged,
             COALESCE(SUM(ch.paid_value_cents) FILTER (WHERE ch.status='RECEIVED'), 0) AS received
        FROM service_orders so LEFT JOIN charges ch ON ch.service_order_id=so.id
       WHERE so.customer_id=$1::uuid`, customer.id,
