@@ -7,6 +7,7 @@ import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { config } from '../src/config.js';
 import { EfiBillingProvider } from '../src/providers/billing/efi.js';
+import { osLabel } from '../src/types.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 assert.ok(databaseUrl, 'DATABASE_URL must identify the migrated, disposable PostgreSQL test database');
@@ -2075,6 +2076,56 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await inbound('cancelar');
     await pending(null);
     assert.deepEqual(await orderItems(order.id), itemsBefore);
+  }],
+  ['continuar OS retoma rascunho sem valor e com valor; rejeita OS inexistente ou já fechada', async () => {
+    await seedCustomer('Cliente Retoma');
+    // Abandono real: a pendência expira (30min), não um 'cancelar' explícito
+    // — a OS segue no banco em qualquer estado em que parou, só sem
+    // conversation_state apontando mais para ela.
+    const draftA = await beginKnownOrder('Atendimento abandonado sem valor', 'Cliente Retoma');
+    await prisma.$executeRawUnsafe("UPDATE conversation_states SET expires_at=now()-interval '1 second' WHERE service_order_id=$1::uuid", draftA.id);
+    assert.match((await inbound('oi')).text, /expir/i);
+    await pending(null);
+    assert.equal((await orders()).find((order) => order.id === draftA.id)!.status, 'AGUARDANDO_DADOS');
+    const resumedA = await inbound(`continuar OS ${draftA.number}`);
+    assert.match(resumedA.text, new RegExp(`Retomando a ${osLabel(draftA.number)}\\. Qual é o valor do atendimento\\?`));
+    const stateA = await pending('VALUE');
+    assert.equal(stateA.service_order_id, draftA.id);
+    assert.match((await inbound('80')).text, /materiais/i);
+    await pending('materials');
+    await inbound('não');
+    await pending('CONFIRM');
+    const doneA = await inbound('sim');
+    assert.match(doneA.text, /confirmada/i);
+    await pending(null);
+    assert.equal((await orders()).find((order) => order.id === draftA.id)!.status, 'CONFIRMADA');
+
+    // Rascunho B já tem valor (AGUARDANDO_CONFIRMACAO) quando expira.
+    const draftB = await beginKnownOrder('Atendimento abandonado com valor', 'Cliente Retoma');
+    await inbound('120');
+    await pending('materials');
+    await inbound('não');
+    await pending('CONFIRM');
+    assert.equal((await orders()).find((order) => order.id === draftB.id)!.status, 'AGUARDANDO_CONFIRMACAO');
+    await prisma.$executeRawUnsafe("UPDATE conversation_states SET expires_at=now()-interval '1 second' WHERE service_order_id=$1::uuid", draftB.id);
+    assert.match((await inbound('oi')).text, /expir/i);
+    await pending(null);
+    const resumedB = await inbound(`continuar OS ${draftB.number}`);
+    assert.match(resumedB.text, new RegExp(`^${osLabel(draftB.number)}`));
+    assert.match(resumedB.text, /Valor: R\$ 120,00/);
+    assert.match(resumedB.text, /Confirma\? Responda sim ou cancelar\.$/);
+    const stateB = await pending('CONFIRM');
+    assert.equal(stateB.service_order_id, draftB.id);
+    const doneB = await inbound('sim');
+    assert.match(doneB.text, /confirmada/i);
+    await pending(null);
+
+    // Rejeições determinísticas: OS inexistente e OS já fechada (nenhuma pendência criada).
+    assert.match((await inbound('continuar OS 999')).text, /OS não encontrada\./);
+    await pending(null);
+    const closed = await inbound(`continuar OS ${draftA.number}`);
+    assert.match(closed.text, new RegExp(`A ${osLabel(draftA.number)} já está confirmada; não há rascunho para retomar\\.`));
+    await pending(null);
   }],
   ['concurrent messages with a materials answer stay FIFO without reordering stock', async () => {
     const cabo = await seedItem('Cabo', 'm', '10');

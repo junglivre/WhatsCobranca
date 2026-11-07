@@ -507,7 +507,7 @@ async function processQuery(
 ): Promise<boolean> {
   if (/^ajuda$/i.test(body)) {
     await queueReply(tx, operatorId, sourceMessageId, replyTo, [
-      'Atendimento: novo; OS <n>; mostra as OS do <nome>; o que fiz hoje?; corrigir valor|descrição|materiais; cancelar; cancelar OS <n>.',
+      'Atendimento: novo; OS <n>; mostra as OS do <nome>; o que fiz hoje?; corrigir valor|descrição|materiais; cancelar; cancelar OS <n>; continuar OS <n>.',
       'Clientes: cliente <nome>; histórico <nome>; telefone <nome> <número>; email <nome> <endereço>; endereco <nome> | <rua>, <nº>, <bairro>, <cidade>/<UF>, <CEP>; cpf <nome> <documento>; autorizar <nome>; revogar <nome>.',
       'Estoque: material novo; entrada <qtd> <material> [custo <valor>]; ajustar <material> para <qtd>; devolver <qtd> <material> OS <n>; saldo <material>; estoque.',
       'Cobrança: cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]; cobranças; vencidas; recebi OS <n> <valor> [pix|dinheiro]; cancelar cobrança OS <n>.',
@@ -2163,6 +2163,37 @@ async function executeOrderCancellation(
 }
 
 async function handleOrderLifecycleCommand(tx: Tx, message: MessageRow, body: string, replyTo: string): Promise<boolean> {
+  // Retomar rascunho abandonado: a OS fica em AGUARDANDO_DADOS (sem valor) ou
+  // AGUARDANDO_CONFIRMACAO (valor já definido) no banco mesmo depois que o
+  // operador inicia outro atendimento e sobrescreve o único conversation_state
+  // do operador. orderSummary() e o handler CONFIRM leem tudo do banco — nada
+  // do payload original é necessário para retomar.
+  const resume = /^continuar\s+OS\s+(\d+)$/i.exec(body);
+  if (resume) {
+    const rows = await tx.$queryRawUnsafe<Array<{ id: string; number: number; status: string }>>(
+      'SELECT id, number, status FROM service_orders WHERE number=$1', Number(resume[1]),
+    );
+    const order = rows[0];
+    if (!order) {
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'OS não encontrada.', 'order-resume-missing');
+      return true;
+    }
+    if (order.status === 'CONFIRMADA' || order.status === 'CANCELADA') {
+      await queueReply(tx, message.operator_id, message.id, replyTo,
+        `A ${osLabel(order.number)} já está ${order.status === 'CONFIRMADA' ? 'confirmada' : 'cancelada'}; não há rascunho para retomar.`,
+        'order-resume-closed');
+      return true;
+    }
+    if (order.status === 'AGUARDANDO_DADOS') {
+      await saveState(tx, message.operator_id, 'VALUE', {}, order.id, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo,
+        `Retomando a ${osLabel(order.number)}. Qual é o valor do atendimento?`, 'order-resume-value');
+      return true;
+    }
+    await saveState(tx, message.operator_id, 'CONFIRM', {}, order.id, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo, await orderSummary(tx, order.id), 'order-resume-confirm');
+    return true;
+  }
   const parsed = /^cancelar\s+OS\s+(\d+)$/i.exec(body);
   if (!parsed) return false;
   const rows = await tx.$queryRawUnsafe<CancelOrderRow[]>(

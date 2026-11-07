@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0 — Retomar rascunho abandonado (fecha última limitação documentada da POC)
+
+- `continuar OS <n>`: para OS em `AGUARDANDO_DADOS` (sem valor), reabre a pergunta de valor; para `AGUARDANDO_CONFIRMACAO` (valor já definido), mostra o resumo pronto para `sim`/`cancelar`. Tudo lido do banco — nenhum dado do rascunho original (descrição, cliente, materiais já respondidos) depende do `conversation_states` que expirou. OS `CONFIRMADA`/`CANCELADA` responde que não há rascunho para retomar; OS inexistente responde determinístico.
+- 1 cenário novo cobrindo os dois casos de retomada e as duas rejeições (63 no total).
+
 ## 0.8.0 — Custo médio de material (fecha limitação da Fase 5)
 
 - `inventory_items.average_cost_cents`: custo médio ponderado, `NULL` até a primeira entrada com custo informado — nunca inventa zero.

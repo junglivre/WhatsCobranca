@@ -125,7 +125,7 @@ Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`)
 
 **Privacidade:** nenhum byte de áudio é persistido nem vai para disco local — só o texto da transcrição fica no banco (coluna `messages.transcription`). O servidor Groq recebe os bytes por HTTPS e é tratado como processador externo; para instalações sem Groq, o áudio é simplesmente rejeitado sem sair da rede local.
 
-**Limitação conhecida (POC):** o comando `cancelar OS <n>` cobre rascunhos e OS confirmadas, mas não há comando para retomar um rascunho abandonado; inicie um novo atendimento se precisar refazê-lo.
+**Retomar rascunho abandonado:** uma pendência expira em 30 minutos sem resposta — a OS fica no banco em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO`, sem conversa ativa apontando para ela. `continuar OS <n>` retoma exatamente de onde parou: pede o valor se ainda faltar, ou mostra o resumo pronto para `sim`/`cancelar` se o valor já estiver definido (materiais ainda não respondidos podem ser adicionados depois com `corrigir materiais`). OS já `CONFIRMADA`/`CANCELADA` responde que não há rascunho para retomar.
 
 ## Estoque (Fase 5)
 
