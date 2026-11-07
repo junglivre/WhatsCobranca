@@ -1,5 +1,15 @@
 # Boleto com link real + correções pós-Efí (2026-11-07)
 
+---
+
+# Custo médio de material (2026-11-07)
+
+Fecha a limitação "custo médio do material não é calculado" (citada duas vezes no README). `entrada <qtd> <material> [custo <valor>]` + passo opcional no `material novo` (só com saldo>0); média ponderada em SQL puro numa única UPDATE.
+
+Bug pré-existente achado no caminho: `parseQuantity('0')` sempre rejeitava literal `0` no prompt "Saldo inicial? (número, ou 0)" — a feature prometida pelo próprio texto nunca funcionou. Corrigido (tratamento especial de `'0'` antes de `parseQuantity`), pré-requisito para o branch "saldo zero pula a pergunta de custo" ser alcançável.
+
+**Verificação:** `npm run verify` 62/62 + VERIFY PASS (commit 841b532). Smoke real em produção: `material novo` com saldo 15 + custo R$4,50 → resumo mostra "Custo médio: R$ 4,50/m" → `entrada 10 ... custo 7,00` → "Entrada registrada... Custo médio: R$ 5,50/m" (confere: (15×450+10×700)/25=550) → `saldo` mostra "· custo médio R$ 5,50/m". Deploy com migração `202611070003_material_average_cost` aplicada.
+
 ## Boleto: link do PDF em vez de "consulte o painel"
 
 - README/CHANGELOG documentavam "boleto cria a cobrança mas não baixa o PDF (link no painel do provedor)" como limitação conhecida. A API Asaas já devolve `bankSlipUrl` (link direto do PDF) na própria resposta de `POST /payments` — confirmado contra a doc oficial (`docs.asaas.com/reference/criar-nova-cobranca`, schema `PaymentGetResponseDTO`).
