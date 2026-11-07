@@ -145,7 +145,7 @@ Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`
 
 | Porta | Interface | Adapters atuais | Futuros sem refactor |
 |---|---|---|---|
-| Cobrança | `core-api/src/providers/billing/types.ts` (`BillingProvider`) | `asaas`, `manual` | Gerencianet, Mercado Pago, PIX direto via PSP… |
+| Cobrança | `core-api/src/providers/billing/types.ts` (`BillingProvider`) | `asaas`, `efi`, `manual` | Gerencianet, Mercado Pago, PIX direto via PSP… |
 | NFS-e | `core-api/src/providers/invoices/types.ts` (`InvoiceProvider`) | `manual` (pendência p/ emissão humana) | `asaas` (Fase 7), **Portal Nacional direto** (sem terceiro) |
 
 Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|manual`. Registry em `core-api/src/providers/registry.ts`.
@@ -157,6 +157,14 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 - `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
 - `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
+
+### Adapter Efí Pay (`BILLING_PROVIDER=efi`)
+
+Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado deterministicamente da `externalReference` — `OS-12-C3` → 30 caracteres alfanuméricos). OAuth2 `client_credentials` com cache em memória; copia-e-cola vem do próprio corpo da cob; cancelamento é `PATCH` para `REMOVIDA_BY_USUARIO`; timeout/5xx reconcilia por `GET /v2/cob/{txid}` antes de qualquer reenvio. **Boleto não é suportado** — `cobrar OS n boleto` responde de forma determinística e a intenção fica `ERROR`.
+
+**Webhook Efí:** a Efí não envia headers customizáveis — cadastre a URL **com o token na query**: `https://SEU-DOMINIO/webhooks/billing/efi?token=<EFI_WEBHOOK_TOKEN>` (via `PUT /v2/webhook/{chave-pix}` com o mesmo valor). O payload `{pix:[{endToEndId, txid, valor}]}` é normalizado para `RECEIVED` com dedup por `endToEndId`.
+
+**Env:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_BASE_URL` (default sandbox), `EFI_WEBHOOK_TOKEN`; produção exige mTLS — `EFI_CERT_BASE64`/`EFI_KEY_BASE64` (certificado ICP-Brasil em base64). O registry falha no boot se a configuração mínima faltar. Não há cliente de teste real contra a Efí nesta POC: o adapter é coberto por um fake HTTP que espelha esses endpoints; validação em homologação da Efí depende das credenciais da conta.
 - `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas exige CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
 
 ### Cadastro e ciclo de vida da OS (Fase 6.5)

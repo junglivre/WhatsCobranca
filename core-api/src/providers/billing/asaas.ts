@@ -163,6 +163,7 @@ export class AsaasBillingProvider implements BillingProvider {
 
   validateAndNormalizeWebhook(
     headers: Record<string, string | string[] | undefined>,
+    _query: Record<string, string | string[] | undefined>,
     rawBody: unknown,
   ): NormalizedBillingEvent | null {
     const header = headers['asaas-access-token'];

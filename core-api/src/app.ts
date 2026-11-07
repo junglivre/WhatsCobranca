@@ -467,7 +467,7 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     }
     let event: NormalizedBillingEvent | null;
     try {
-      event = billing.validateAndNormalizeWebhook(request.headers, parsed);
+      event = billing.validateAndNormalizeWebhook(request.headers, request.query as Record<string, string | string[] | undefined>, parsed);
     } catch (error) {
       if (error instanceof WebhookAuthError) {
         return reply.code(401).send({ error: 'invalid_token' });

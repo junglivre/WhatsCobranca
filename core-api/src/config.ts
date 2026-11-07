@@ -22,10 +22,20 @@ const schema = z.object({
   // comando 'recebi' continua registrando recebimento externo via provider
   // manual); 'asaas' exige ASAAS_API_KEY e ASAAS_WEBHOOK_TOKEN (registry
   // falha no boot se faltar).
-  BILLING_PROVIDER: z.enum(['none', 'manual', 'asaas']).default('none'),
+  BILLING_PROVIDER: z.enum(['none', 'manual', 'asaas', 'efi']).default('none'),
   ASAAS_API_KEY: z.string().trim().default(''),
   ASAAS_BASE_URL: z.string().url().default('https://api-sandbox.asaas.com/v3'),
   ASAAS_WEBHOOK_TOKEN: z.string().trim().default(''),
+  // Efí Pay (Pix cob com txid; OAuth2 client_credentials; boleto fora).
+  // Produção exige mTLS: EFI_CERT_BASE64/EFI_KEY_BASE64 (ICP-Brasil). O
+  // webhook da Efí não tem header — a URL cadastrada leva ?token=<segredo>.
+  EFI_CLIENT_ID: z.string().trim().default(''),
+  EFI_CLIENT_SECRET: z.string().trim().default(''),
+  EFI_PIX_KEY: z.string().trim().default(''),
+  EFI_BASE_URL: z.string().url().default('https://api-sandbox.efipay.com.br'),
+  EFI_WEBHOOK_TOKEN: z.string().trim().default(''),
+  EFI_CERT_BASE64: z.string().trim().default(''),
+  EFI_KEY_BASE64: z.string().trim().default(''),
   // Fase 6 — porta fiscal: só o adapter 'manual' (pendência para emissão
   // humana) existe nesta fase; fluxo de conversa fiscal é Fase 7.
   INVOICE_PROVIDER: z.enum(['none', 'manual']).default('none'),

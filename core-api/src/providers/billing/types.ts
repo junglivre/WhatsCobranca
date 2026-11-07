@@ -101,6 +101,18 @@ export class MissingFiscalIdError extends Error {
   }
 }
 
+/**
+ * O provedor não suporta o método pedido (ex.: boleto num adapter só-Pix).
+ * Rejeição determinística: nada foi criado — o domínio orienta o operador
+ * sem reconciliar nem reenviar.
+ */
+export class UnsupportedMethodError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UnsupportedMethodError';
+  }
+}
+
 export interface BillingProvider {
   /** Chave do adapter — gravada em charges.provider. Ex.: 'asaas', 'manual'. */
   readonly name: string;
@@ -139,6 +151,7 @@ export interface BillingProvider {
    */
   validateAndNormalizeWebhook(
     headers: Record<string, string | string[] | undefined>,
+    query: Record<string, string | string[] | undefined>,
     rawBody: unknown,
   ): NormalizedBillingEvent | null;
 }

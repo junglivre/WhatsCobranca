@@ -5,6 +5,7 @@ import type { Config } from '../config.js';
 import type { BillingProvider } from './billing/types.js';
 import { ManualBillingProvider } from './billing/manual.js';
 import { AsaasBillingProvider } from './billing/asaas.js';
+import { EfiBillingProvider } from './billing/efi.js';
 import type { InvoiceProvider } from './invoices/types.js';
 import { ManualInvoiceProvider } from './invoices/manual.js';
 
@@ -21,6 +22,11 @@ export function getBillingProvider(cfg: Config): BillingProvider | null {
         throw new Error('BILLING_PROVIDER=asaas exige ASAAS_API_KEY e ASAAS_WEBHOOK_TOKEN não-vazios');
       }
       return new AsaasBillingProvider(cfg);
+    case 'efi':
+      if (!cfg.EFI_CLIENT_ID || !cfg.EFI_CLIENT_SECRET || !cfg.EFI_PIX_KEY || !cfg.EFI_WEBHOOK_TOKEN) {
+        throw new Error('BILLING_PROVIDER=efi exige EFI_CLIENT_ID, EFI_CLIENT_SECRET, EFI_PIX_KEY e EFI_WEBHOOK_TOKEN não-vazios');
+      }
+      return new EfiBillingProvider(cfg);
   }
 }
 

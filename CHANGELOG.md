@@ -1,4 +1,14 @@
 # Changelog
+
+## 0.7.0 — Integração Efí Pay (cobrança Pix plugável)
+
+- Terceiro adapter da porta `BillingProvider`: `BILLING_PROVIDER=efi` — cobrança Pix via API Pix padrão BCB (`PUT /v2/cob/{txid}`), txid determinístico derivado da `externalReference` (26–35 alfanuméricos). Registry fail-fast sem credenciais.
+- OAuth2 `client_credentials` com cache em memória; transport próprio http/https com mTLS opcional (`EFI_CERT_BASE64`/`EFI_KEY_BASE64`, exigido em produção Pix).
+- Webhook Efí com token na query (`/webhooks/billing/efi?token=...`, comparação constant-time) — a porta ganhou `query` em `validateAndNormalizeWebhook`; payload `{pix:[...]}` normalizado para `RECEIVED` com dedup por `endToEndId`.
+- `UnsupportedMethodError` na porta: `cobrar OS n boleto` com Efí responde determinístico e a intenção fica `ERROR` (boleto fora do adapter).
+- Timeout/5xx na criação reconcilia por `GET /v2/cob/{txid}` antes de reenviar (mesma regra do Asaas); cancelamento via `PATCH` `REMOVIDA_BY_USUARIO`.
+- Fake Efí no teste de integração (oauth/PUT/GET/PATCH com ledger e create-then-500) + 3 cenários (58 no total). Validação contra a Efí real fica pendente de credenciais de homologação.
+
 ## 0.6.0 — Fase 8: Relatórios, automações e baixa de nota
 
 - `fechamento` e `relatorio semanal` sob demanda: OS confirmadas, recebido, cobrado (semanal) e cobranças abertas — SQL puro, centavos inteiros, janelas em America/Sao_Paulo.

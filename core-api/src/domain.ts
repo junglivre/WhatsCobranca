@@ -4,7 +4,7 @@ import { formatMoney, formatQty, isNo, isYes, normalize, osLabel, parseMoney, pa
 import { downloadWahaMedia, MediaFailure } from './waha.js';
 import { extractServiceIntent, GroqFailure, transcribeAudio, type Extraction } from './groq.js';
 import { getBillingProvider, getInvoiceProvider } from './providers/registry.js';
-import { MissingFiscalIdError } from './providers/billing/types.js';
+import { MissingFiscalIdError, UnsupportedMethodError } from './providers/billing/types.js';
 import type { CreatedCharge } from './providers/billing/types.js';
 import type { InvoiceRequestResult } from './providers/invoices/types.js';
 
@@ -1605,6 +1605,7 @@ async function executeChargeCreation(
   let created: CreatedCharge | null = null;
   let failureName = 'erro';
   let fiscalIdMissing = false;
+  let unsupportedMethod: string | null = null;
   try {
     const refs = await tx.$queryRawUnsafe<Array<{ external_id: string }>>(
       'SELECT external_id FROM customer_provider_refs WHERE customer_id=$1::uuid AND provider=$2',
@@ -1636,8 +1637,19 @@ async function executeChargeCreation(
     });
   } catch (error) {
     fiscalIdMissing = error instanceof MissingFiscalIdError;
+    unsupportedMethod = error instanceof UnsupportedMethodError ? error.message : null;
     failureName = fiscalIdMissing ? 'CPF/CNPJ ausente'
       : error instanceof Error && error.name === 'ProviderTimeoutError' ? 'timeout' : 'erro';
+  }
+  if (!created && unsupportedMethod) {
+    // Rejeição determinística: o provedor não suporta o método — nada foi
+    // criado lá, reconcilar não resolve. Orienta trocar método/provedor.
+    await tx.$executeRawUnsafe("UPDATE charges SET status='ERROR', updated_at=now() WHERE id=$1::uuid", chargeId);
+    await saveState(tx, operatorId, null, null, null, replyTo);
+    await queueReply(tx, operatorId, message.id, replyTo,
+      `${unsupportedMethod} A intenção foi marcada como ERROR; tente com pix.`,
+      'charge-unsupported-method');
+    return;
   }
   if (!created && fiscalIdMissing) {
     // Rejeição determinística do provedor: nada foi criado lá — reconciliar

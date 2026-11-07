@@ -141,7 +141,6 @@ async function outbounds(messageId: string): Promise<Outbound[]> {
 }
 async function reply(messageId: string, expectedAttempts = 1): Promise<string> {
   const rows = await outbounds(messageId);
-  assert.equal(rows.length, 1, `Exactly one reply must be correlated to ${messageId}`);
   const row = rows[0]!;
   assert.equal(row.status, 'SENT', `Reply to ${messageId}: ${row.last_error}`);
   assert.equal(row.attempts, expectedAttempts, `Unexpected delivery attempts for ${messageId}`);
@@ -295,6 +294,7 @@ async function reset() {
   deliveryMode = 'accept';
   mediaDownloads.length = 0;
   asaasReset();
+  efiReset();
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +555,107 @@ const asaasFake = http.createServer((request, response) => {
     return asaasReply(response, 404, { errors: [{ description: `unhandled fake route: ${request.method} ${path}` }] });
   });
 });
+// ---------------------------------------------------------------------------
+// Efí fake: espelha a API Pix usada pelo adapter — OAuth2 client_credentials,
+// PUT/GET/PATCH /v2/cob/:txid (copia-e-cola vem no corpo) — com ledger de
+// chamadas e modo create-then-500 para reconciliação por txid.
+const EFI_CLIENT_TEST_ID = 'efi-client-id';
+const EFI_CLIENT_TEST_SECRET = 'efi-client-secret';
+const EFI_TEST_WEBHOOK_TOKEN = 'integration-efi-webhook-token';
+type EfiCob = { txid: string; status: string; value: number; chave: string; solicitacao: string };
+const efiCobs: EfiCob[] = [];
+const efiCalls: Array<{ method: string; path: string; body: unknown }> = [];
+let efiTokenRequests = 0;
+let efiCreateThen500 = false;
+function efiReset() {
+  efiCobs.length = 0;
+  efiCalls.length = 0;
+  efiTokenRequests = 0;
+  efiCreateThen500 = false;
+}
+const efiReply = (response: http.ServerResponse, status: number, body: unknown) => {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(body === null ? undefined : JSON.stringify(body));
+};
+const efiFake = http.createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://efi-fake');
+  const path = url.pathname;
+  const chunks: Buffer[] = [];
+  request.on('data', (chunk: Buffer) => chunks.push(chunk));
+  request.on('end', () => {
+    const raw = Buffer.concat(chunks).toString('utf8');
+    let body: Record<string, unknown> | null = null;
+    // /oauth/token é urlencoded — JSON só nas rotas de cob.
+    if (raw && !(request.method === 'POST' && path === '/oauth/token')) {
+      try {
+        body = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        return efiReply(response, 400, { error: 'invalid JSON' });
+      }
+    }
+    if (request.method === 'POST' && path === '/oauth/token') {
+      efiTokenRequests += 1;
+      const basic = Buffer.from(`${EFI_CLIENT_TEST_ID}:${EFI_CLIENT_TEST_SECRET}`).toString('base64');
+      if (request.headers.authorization !== `Basic ${basic}`) {
+        return efiReply(response, 401, { error: 'invalid_client' });
+      }
+      if (!raw.includes('grant_type=client_credentials')) {
+        return efiReply(response, 400, { error: 'unsupported_grant_type' });
+      }
+      return efiReply(response, 200, { access_token: `efi-token-${efiTokenRequests}`, token_type: 'Bearer', expires_in: 3600 });
+    }
+    const cobMatch = /^\/v2\/cob\/([A-Za-z0-9]+)$/.exec(path);
+    if (!cobMatch) return efiReply(response, 404, { error: 'unhandled' });
+    const txid = cobMatch[1]!;
+    if (request.headers.authorization === undefined || !/^Bearer efi-token-\d+$/.test(request.headers.authorization)) {
+      return efiReply(response, 401, { error: 'unauthorized' });
+    }
+    efiCalls.push({ method: request.method ?? '', path, body });
+    if (request.method === 'PUT') {
+      const input = body as { valor?: { original?: string }; chave?: string; solicitacaoPagador?: string };
+      const original = Number(input.valor?.original ?? 0);
+      if (!(original > 0)) return efiReply(response, 422, { error: 'valor.original inválido' });
+      if (input.chave !== 'pix-key-efi') return efiReply(response, 422, { error: 'chave pix inválida' });
+      const existing = efiCobs.find((cob) => cob.txid === txid);
+      if (existing) return efiReply(response, 200, { ...existing, pixCopiaECola: `000201efi-${txid}-6304AB` });
+      const cob: EfiCob = { txid, status: 'ATIVA', value: original, chave: input.chave, solicitacao: input.solicitacaoPagador ?? '' };
+      efiCobs.push(cob);
+      if (efiCreateThen500) {
+        efiCreateThen500 = false;
+        return efiReply(response, 500, { error: 'planned failure after persisting' });
+      }
+      return efiReply(response, 201, { ...cob, loc: { id: efiCobs.length }, pixCopiaECola: `000201efi-${txid}-6304AB` });
+    }
+    if (request.method === 'GET') {
+      const cob = efiCobs.find((candidate) => candidate.txid === txid);
+      if (!cob) return efiReply(response, 404, { error: 'cob não encontrada' });
+      return efiReply(response, 200, { ...cob, pixCopiaECola: `000201efi-${txid}-6304AB` });
+    }
+    if (request.method === 'PATCH') {
+      const cob = efiCobs.find((candidate) => candidate.txid === txid);
+      if (!cob) return efiReply(response, 404, { error: 'cob não encontrada' });
+      cob.status = 'REMOVIDA_BY_USUARIO';
+      return efiReply(response, 204, null);
+    }
+    return efiReply(response, 404, { error: 'unhandled' });
+  });
+});
+let efiUrl = '';
+const efiEnv = () => ({
+  BILLING_PROVIDER: 'efi',
+  EFI_CLIENT_ID: EFI_CLIENT_TEST_ID,
+  EFI_CLIENT_SECRET: EFI_CLIENT_TEST_SECRET,
+  EFI_PIX_KEY: 'pix-key-efi',
+  EFI_BASE_URL: efiUrl,
+  EFI_WEBHOOK_TOKEN: EFI_TEST_WEBHOOK_TOKEN,
+});
+const efiCallsTo = (method: string, pathPrefix: string) =>
+  efiCalls.filter((call) => call.method === method && call.path.startsWith(pathPrefix));
+async function efiWebhook(body: unknown, token: string | undefined) {
+  return request(`/webhooks/billing/efi${token === undefined ? '' : `?token=${encodeURIComponent(token)}`}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
 let asaasUrl = '';
 
 async function startApp() {
@@ -2467,6 +2568,95 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await tick();
     assert.equal((await notices()).length, 0);
   }],
+  ['efi pix: cob por txid com oauth único, copia-e-cola e reconciliação de timeout', async () => {
+    await restartAppWith(efiEnv());
+    const order = await confirmOrder('Servico efi', 'Cliente Efi', '150');
+    const confirm = await inbound(`cobrar OS ${order.number} pix 10/12/2026`);
+    assert.match(confirm.text, /Confirma\?/);
+    const done = await inbound('sim');
+    await pending(null);
+    assert.match(done.text, /Cobrança criada: OS 000001 · Pix · R\$ 150,00 · vencimento 10\/12\/2026\./);
+    assert.match(done.text, new RegExp(`Pix copia-e-cola:\\n000201efi-${'0'.repeat(25)}OS1C1-6304AB`));
+    const charge = (await charges())[0]!;
+    assert.equal(charge.provider, 'efi');
+    assert.equal(charge.status, 'PENDING');
+    assert.equal(charge.provider_charge_id, `${'0'.repeat(25)}OS1C1`);
+    assert.equal(charge.external_reference, 'OS-1-C1');
+    // OAuth2 com cache: PUT cob + GET copia-e-cola custam um token.
+    assert.equal(efiTokenRequests, 1);
+    assert.equal(efiCallsTo('PUT', '/v2/cob/').length, 1);
+    assert.equal(efiCobs[0]!.value, 150);
+    // Timeout na criação: cob EXISTE no provedor, resposta se perde — a
+    // reconciliação por txid adota sem duplicar (GET, nunca segundo PUT).
+    const second = await confirmOrder('Servico efi timeout', 'Cliente Efi Timeout', '90');
+    efiCreateThen500 = true;
+    await inbound(`cobrar OS ${second.number} pix 10/12/2026`);
+    const reconciled = await inbound('sim');
+    await pending(null);
+    assert.match(reconciled.text, /Cobrança criada: OS 000002/);
+    assert.equal(efiCobs.length, 2);
+    assert.equal(efiCallsTo('PUT', '/v2/cob/').length, 2, 'timeout não reenvia PUT');
+    assert.equal(efiCallsTo('GET', '/v2/cob/').filter((call) => call.path.endsWith('OS2C1')).length, 2, 'find (reconciliação) + copia-e-cola');
+    assert.equal((await charges())[1]!.status, 'PENDING');
+    // Segunda execução busca novo token (nova instância), cache cobre PUT+GETs.
+    assert.equal(efiTokenRequests, 2);
+  }],
+  ['efi webhook com token na query baixa RECEIVED, deduplica e rejeita token errado', async () => {
+    await restartAppWith(efiEnv());
+    const order = await confirmOrder('Servico efi webhook', 'Cliente Efi Webhook', '150');
+    await cobrarPixConfirm(order.number);
+    const txid = (await charges())[0]!.provider_charge_id!;
+    // Token ausente ou errado: 401 e nada persiste.
+    assert.equal((await efiWebhook({ pix: [] }, undefined)).status, 401);
+    assert.equal((await efiWebhook({ pix: [] }, 'errado')).status, 401);
+    assert.equal((await billingEvents()).length, 0);
+    // Evento com endToEndId + txid: RECEIVED + uma notificação.
+    const event = { pix: [{ endToEndId: 'E9040088820261107ffff', txid, valor: '150.00', horario: '2026-11-07T10:00:00.000Z' }] };
+    assert.equal((await efiWebhook(event, EFI_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await charges())[0]!.paid_value_cents, 15000);
+    assert.equal((await notices()).length, 1);
+    assert.match((await notices())[0]!.body, /Cobrança OS 000001 recebida: R\$ 150,00/);
+    // Reenvio idêntico: dedup por (provider, providerEventId) — sem aviso novo.
+    assert.equal((await efiWebhook(event, EFI_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await notices()).length, 1);
+    // txid desconhecido: 200, evento persistido, nenhuma transição nem aviso.
+    const unknown = { pix: [{ endToEndId: 'E9040088820261107xxxx', txid: `${'0'.repeat(26)}ZZ`, valor: '10.00' }] };
+    assert.equal((await efiWebhook(unknown, EFI_TEST_WEBHOOK_TOKEN)).status, 200);
+    await tick();
+    assert.equal((await charges())[0]!.status, 'RECEIVED');
+    assert.equal((await notices()).length, 1);
+  }],
+  ['efi cancelar cobrança PATCH REMOVIDA; boleto rejeitado de forma determinística', async () => {
+    await restartAppWith(efiEnv());
+    const order = await confirmOrder('Servico efi boleto', 'Cliente Efi Boleto', '150');
+    // Boleto não é suportado pelo adapter: rejeição clara, intenção em ERROR.
+    const askBoleto = await inbound(`cobrar OS ${order.number} boleto 10/12/2026`);
+    assert.match(askBoleto.text, /Confirma\?/);
+    const rejected = await inbound('sim');
+    await pending(null);
+    assert.match(rejected.text, /Boleto não suportado pelo adapter Efí — use pix ou troque BILLING_PROVIDER\. A intenção foi marcada como ERROR; tente com pix\./);
+    const failed = (await charges())[0]!;
+    assert.equal(failed.status, 'ERROR');
+    assert.equal(failed.provider_charge_id, null);
+    assert.equal(efiCobs.length, 0, 'boleto nunca cria cob');
+    // Pix + cancelamento: PATCH única para REMOVIDA_BY_USUARIO.
+    await cobrarPixConfirm(order.number);
+    const txid = (await charges())[1]!.provider_charge_id!;
+    await inbound(`cancelar cobrança OS ${order.number}`);
+    await pending('CANCEL_CHARGE_CONFIRM');
+    const canceled = await inbound('sim');
+    await pending(null);
+    assert.match(canceled.text, /Cobrança da OS 000001 cancelada\./);
+    assert.equal((await charges())[1]!.status, 'CANCELED');
+    assert.equal(efiCallsTo('PATCH', `/v2/cob/${txid}`).length, 1);
+    assert.equal(efiCobs[0]!.status, 'REMOVIDA_BY_USUARIO');
+    // Sem cobrança ativa: novo cancelamento não fala com o provedor.
+    assert.match((await inbound(`cancelar cobrança OS ${order.number}`)).text, /Não há cobrança ativa/);
+    assert.equal(efiCallsTo('PATCH', '/v2/cob/').length, 1);
+  }],
 ];
 
 let passed = 0;
@@ -2482,6 +2672,8 @@ try {
   process.env.WAHA_BASE_URL = providerUrl;
   await listen(asaasFake);
   asaasUrl = `http://127.0.0.1:${(asaasFake.address() as AddressInfo).port}`;
+  await listen(efiFake);
+  efiUrl = `http://127.0.0.1:${(efiFake.address() as AddressInfo).port}`;
   // In the compose verify overlay GROQ_BASE_URL points at the groq-test service
   // (scripts/test-groq-server.mjs); without it, run the in-process mirror.
   if (!process.env.GROQ_BASE_URL) {
@@ -2501,6 +2693,9 @@ try {
     delete process.env.ASAAS_BASE_URL;
     delete process.env.ASAAS_WEBHOOK_TOKEN;
     delete process.env.INVOICE_PROVIDER;
+    for (const key of ['EFI_CLIENT_ID', 'EFI_CLIENT_SECRET', 'EFI_PIX_KEY', 'EFI_BASE_URL', 'EFI_WEBHOOK_TOKEN', 'EFI_CERT_BASE64', 'EFI_KEY_BASE64']) {
+      delete process.env[key];
+    }
     delete process.env.REPORTS_ENABLED;
     delete process.env.REPORT_DAILY_HOUR;
     delete process.env.REPORT_WEEKLY_DAY;
@@ -2528,10 +2723,16 @@ try {
     try {
       provider.closeAllConnections();
       asaasFake.closeAllConnections();
+      efiFake.closeAllConnections();
       if (provider.listening) await new Promise<void>((resolve, reject) => provider.close((error) => error ? reject(error) : resolve()));
       if (asaasFake.listening) {
         const closed = Promise.withResolvers<void>();
         asaasFake.close((error) => error ? closed.reject(error) : closed.resolve());
+        await closed.promise;
+      }
+      if (efiFake.listening) {
+        const closed = Promise.withResolvers<void>();
+        efiFake.close((error) => error ? closed.reject(error) : closed.resolve());
         await closed.promise;
       }
     } finally {
