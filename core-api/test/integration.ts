@@ -288,7 +288,7 @@ async function beginOrderToMaterials(description: string, customerName: string, 
 }
 async function reset() {
   // Only the disposable *_test database supplied by verify.sh can reach this operation.
-  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, billing_events, charges, invoices, customer_provider_refs, service_orders, inventory_items, customers');
+  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, billing_events, charges, invoices, report_deliveries, customer_provider_refs, service_orders, inventory_items, customers');
   await prisma.$executeRawUnsafe('ALTER SEQUENCE service_order_number_seq RESTART WITH 1');
   deliveries.length = 0;
   providerAttempts.length = 0;
@@ -2352,6 +2352,121 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await restartAppWith({});
     assert.match((await inbound('notas')).text, /Nenhuma solicitação fiscal pendente\./);
   }],
+  ['nota emitida registra AUTHORIZED com número; cancelar nota fecha a solicitação', async () => {
+    await restartAppWith({ INVOICE_PROVIDER: 'manual' });
+    const order = await confirmOrder('Servico baixa nota', 'Cliente Baixa Nota', '150');
+    await inbound('cpf Cliente Baixa Nota 52998224725');
+    await inbound(`emitir NF OS ${order.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    await inbound('sim');
+    await pending(null);
+    // Uso incorreto e OS sem solicitação: determinístico.
+    assert.match((await inbound('nota emitida OS 1')).text, /Use: nota emitida OS <número> <número da NFS-e>/);
+    assert.match((await inbound('cancelar nota OS 99')).text, /Não há solicitação fiscal ativa para a OS 000099\./);
+    // Baixa com o número da nota emitida no Portal Nacional.
+    const settled = await inbound(`nota emitida OS ${order.number} 1024`);
+    await pending(null);
+    assert.match(settled.text, /Nota da OS 000001 registrada como emitida \(nº 1024\)\./);
+    const rows = await invoices();
+    assert.equal(rows[0]!.status, 'AUTHORIZED');
+    assert.equal((rows[0]!.payload as Record<string, unknown>).nfsNumber, '1024');
+    assert.deepEqual((await audits(settled.id)).map((entry) => [entry.entity_type, entry.action, entry.new_status, entry.reason]),
+      [['invoice', 'INVOICE_AUTHORIZED', 'AUTHORIZED', '1024']]);
+    // Autorizada sai da lista de pendências; repetir a baixa não acha ativa.
+    assert.match((await inbound('notas')).text, /Nenhuma solicitação fiscal pendente\./);
+    assert.match((await inbound(`nota emitida OS ${order.number} 1025`)).text, /Não há solicitação fiscal ativa/);
+    // Nova solicitação pode ser cancelada antes da emissão.
+    const second = await confirmOrder('Servico cancela nota', 'Cliente Cancela Nota', '90');
+    await inbound('cpf Cliente Cancela Nota 12345678000195');
+    await inbound(`emitir NF OS ${second.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    await inbound('sim');
+    await pending(null);
+    const dropped = await inbound(`cancelar nota OS ${second.number}`);
+    await pending(null);
+    assert.match(dropped.text, /Solicitação fiscal da OS 000002 cancelada\./);
+    const after = await invoices();
+    assert.equal(after[1]!.status, 'CANCELED');
+    assert.deepEqual((await audits(dropped.id)).map((entry) => [entry.action, entry.previous_status, entry.new_status]),
+      [['INVOICE_CANCELED', 'NEEDS_REVIEW', 'CANCELED']]);
+    assert.match((await inbound('notas')).text, /Nenhuma solicitação fiscal pendente\./);
+  }],
+  ['fechamento e relatorio semanal sob demanda somam centavos e listam alertas', async () => {
+    await restartAppWith({ INVOICE_PROVIDER: 'manual' });
+    const order = await confirmOrder('Servico fechamento', 'Cliente Fechamento', '180');
+    // Recebimento manual hoje (dinheiro) alimenta recebido e cobrado.
+    await inbound(`recebi OS ${order.number} 100 dinheiro`);
+    await inbound('sim');
+    // Material abaixo do mínimo.
+    await prisma.$executeRawUnsafe(
+      "INSERT INTO inventory_items(name, normalized_name, unit, quantity, min_quantity) VALUES('cabo', 'cabo', 'm', 2, 5)",
+    );
+    // OS incompleta de dois dias atrás.
+    const customerId = await seedCustomer('Cliente Antigo');
+    await prisma.$executeRawUnsafe(
+      "INSERT INTO service_orders(customer_id, description, status, created_at) VALUES($1::uuid, 'Servico antigo', 'AGUARDANDO_DADOS', now() - interval '2 days')",
+      customerId,
+    );
+    // Nota fiscal pendente de emissão humana.
+    await inbound('cpf Cliente Fechamento 52998224725');
+    await inbound(`emitir NF OS ${order.number} 1.02`);
+    await pending('INVOICE_CONFIRM');
+    await inbound('sim');
+    await pending(null);
+    const close = await inbound('fechamento');
+    assert.match(close.text, /^Fechamento \d{2}\/\d{2}\/\d{4}/);
+    assert.match(close.text, /OS confirmadas: 1 · R\$ 180,00/);
+    assert.match(close.text, /Recebido: 1 · R\$ 100,00/);
+    assert.match(close.text, /Cobranças abertas: 0 · R\$ 0,00/);
+    assert.match(close.text, /OS incompletas: OS 000002 \(de \d{2}\/\d{2}\)/);
+    assert.match(close.text, /Notas fiscais pendentes: OS 000001 NEEDS_REVIEW \(OS-1-NF1\)/);
+    assert.match(close.text, /Estoque mínimo: cabo 2\/5 m/);
+    const weekly = await inbound('relatorio semanal');
+    assert.match(weekly.text, /^Relatório semanal \d{2}\/\d{2}\/\d{4}–\d{2}\/\d{2}\/\d{4}/);
+    assert.match(weekly.text, /OS confirmadas: 1 · R\$ 180,00/);
+    assert.match(weekly.text, /Cobrado: 1 · R\$ 100,00/);
+    assert.match(weekly.text, /Recebido: 1 · R\$ 100,00/);
+    assert.match(weekly.text, /Estoque mínimo: cabo 2\/5 m/);
+    // Acento na escrita alternativa também resolve.
+    assert.match((await inbound('relatório semanal')).text, /^Relatório semanal/);
+  }],
+  ['fechamento agendado pelo tick é único por dia e semana; desligar para de enviar', async () => {
+    const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(
+      new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', weekday: 'short' }).format(new Date()),
+    );
+    await restartAppWith({
+      REPORTS_ENABLED: 'true', REPORT_DAILY_HOUR: '0', REPORT_WEEKLY_DAY: String(weekday),
+    });
+    await tick();
+    let sent = (await notices()).map((notice) => notice.body);
+    assert.equal(sent.length, 2, 'fechamento diário + relatório semanal no mesmo tick');
+    assert.match(sent[0]!, /^Fechamento \d{2}\/\d{2}\/\d{4}/);
+    assert.match(sent[1]!, /^Relatório semanal /);
+    // Tick repetido não duplica (report_deliveries + dedup_key).
+    await tick();
+    await tick();
+    sent = (await notices()).map((notice) => notice.body);
+    assert.equal(sent.length, 2);
+    const deliveries = await prisma.$queryRawUnsafe<Array<{ kind: string; period_key: string }>>(
+      'SELECT kind, period_key FROM report_deliveries ORDER BY kind',
+    );
+    assert.equal(deliveries.length, 2);
+    assert.match(deliveries[0]!.period_key, /^\d{4}-\d{2}-\d{2}$/);
+    assert.match(deliveries[1]!.period_key, /^W:\d{4}-\d{2}-\d{2}$/);
+    // Hora ainda não atingida: nada é enviado (usa hora 23 como corte futuro).
+    await prisma.$executeRawUnsafe('DELETE FROM report_deliveries');
+    await prisma.$executeRawUnsafe('DELETE FROM outbound_messages WHERE correlation_message_id IS NULL');
+    await restartAppWith({ REPORTS_ENABLED: 'true', REPORT_DAILY_HOUR: '23', REPORT_WEEKLY_DAY: String(weekday) });
+    const before = (new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hour12: false }).format(new Date()));
+    if (Number(before) < 23) {
+      await tick();
+      assert.equal((await notices()).length, 0, 'antes de REPORT_DAILY_HOUR nada é enviado');
+    }
+    // Desligado por política: nunca envia.
+    await restartAppWith({ REPORTS_ENABLED: 'false', REPORT_DAILY_HOUR: '0', REPORT_WEEKLY_DAY: String(weekday) });
+    await tick();
+    assert.equal((await notices()).length, 0);
+  }],
 ];
 
 let passed = 0;
@@ -2386,6 +2501,12 @@ try {
     delete process.env.ASAAS_BASE_URL;
     delete process.env.ASAAS_WEBHOOK_TOKEN;
     delete process.env.INVOICE_PROVIDER;
+    delete process.env.REPORTS_ENABLED;
+    delete process.env.REPORT_DAILY_HOUR;
+    delete process.env.REPORT_WEEKLY_DAY;
+    // Cenários que não tratam de relatórios rodam com envio desligado: o
+    // fechamento agendado default (18h) faria o suite depender da hora do dia.
+    process.env.REPORTS_ENABLED = 'false';
     if (app) await app.close();
     app = undefined;
     await startApp();

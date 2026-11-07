@@ -221,6 +221,16 @@ model Invoice {
   @@map("invoices")
 }
 
+model ReportDelivery {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  kind      String
+  periodKey String   @map("period_key")
+  sentAt    DateTime @default(now()) @map("sent_at") @db.Timestamptz(6)
+
+  @@unique([kind, periodKey])
+  @@map("report_deliveries")
+}
+
 model StockMovement {
   id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   inventoryItemId String        @map("inventory_item_id") @db.Uuid

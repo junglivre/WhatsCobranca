@@ -29,6 +29,14 @@ const schema = z.object({
   // Fase 6 — porta fiscal: só o adapter 'manual' (pendência para emissão
   // humana) existe nesta fase; fluxo de conversa fiscal é Fase 7.
   INVOICE_PROVIDER: z.enum(['none', 'manual']).default('none'),
+  // Fase 8 — relatórios e alertas. Fechamento diário e relatório semanal
+  // entram na outbox pelo /automation/tick; política de envio = hora local
+  // (America/Sao_Paulo) a partir da qual o do dia é enviado (0 = sempre) e o
+  // dia da semana do semanal (0=domingo … 6=sábado, default 1=segunda).
+  // REPORTS_ENABLED=false desliga tudo (comandos sob demanda continuam).
+  REPORTS_ENABLED: z.enum(['true', 'false']).default('true'),
+  REPORT_DAILY_HOUR: z.coerce.number().int().min(0).max(23).default(18),
+  REPORT_WEEKLY_DAY: z.coerce.number().int().min(0).max(6).default(1),
 });
 export type Config = z.infer<typeof schema>;
 export const config = (env = process.env): Config => schema.parse(env);

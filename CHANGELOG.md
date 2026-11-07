@@ -1,4 +1,12 @@
 # Changelog
+## 0.6.0 — Fase 8: Relatórios, automações e baixa de nota
+
+- `fechamento` e `relatorio semanal` sob demanda: OS confirmadas, recebido, cobrado (semanal) e cobranças abertas — SQL puro, centavos inteiros, janelas em America/Sao_Paulo.
+- Alertas automáticos nos relatórios: OS incompletas de dias anteriores, notas fiscais não concluídas (com referência) e materiais no mínimo.
+- Agendamento no `/automation/tick`: fechamento diário a partir de `REPORT_DAILY_HOUR` (default 18 SP) e semanal em `REPORT_WEEKLY_DAY` (default segunda); `REPORTS_ENABLED=false` desliga. Idempotência por `report_deliveries` (`UNIQUE(kind, period_key)`) + dedup_key — reinício/tick duplicado nunca reenvia.
+- Baixa da nota (Fase 7): `nota emitida OS <n> <número NFS-e>` → `AUTHORIZED` (número auditado em `payload.nfsNumber`); `cancelar nota OS <n>` → `CANCELED` (cancela no emissor quando há id externo).
+- Migração `202611070001_reports`. 3 cenários novos (55 no total); o harness de teste roda com relatórios desligados por padrão para não depender da hora do dia.
+
 
 ## 0.5.0 — Fase 7: Fluxo fiscal plugável
 

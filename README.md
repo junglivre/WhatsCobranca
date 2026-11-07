@@ -192,6 +192,21 @@ A porta `InvoiceProvider` (`core-api/src/providers/invoices/types.ts`) ganhou fl
 
 **Adapter `manual`:** nenhum emissor externo; toda solicitação vira `NEEDS_REVIEW` para emissão humana no Portal Nacional. É a referência para plugares Asaas NFS-e ou Portal Nacional direto: implemente a interface (agora com `findByExternalReference`), registre no `registry.ts` e no enum do `config.ts`.
 
+## Relatórios e automações (Fase 8)
+
+Sob demanda ou agendados, sempre montados por SQL (centavos inteiros, datas em America/Sao_Paulo) e entregues pela outbox existente.
+
+**Comandos do operador:**
+
+- `fechamento` — OS confirmadas do dia, recebido do dia, cobranças abertas (+vencidas) e alertas.
+- `relatorio semanal` (ou `relatório semanal`) — OS confirmadas, cobrado e recebido da semana (segunda até hoje) + estado atual.
+
+**Alertas** (aparecem nos dois relatórios, só quando existe pendência): OS incompletas de dias anteriores, notas fiscais não concluídas (`NEEDS_REVIEW` etc., com referência) e materiais no mínimo (`saldo/mínimo unidade`).
+
+**Agendamento e política de envio** (env): `REPORTS_ENABLED` (`true`/`false`, default `true`), `REPORT_DAILY_HOUR` (0–23, default `18` — hora local a partir da qual o tick envia o fechamento do dia), `REPORT_WEEKLY_DAY` (0=domingo … 6=sábado, default `1`=segunda, enviado no mesmo horário). Idempotência por período em `report_deliveries` (`UNIQUE(kind, period_key)`) + `dedup_key` na outbox: tick duplicado ou Core reiniciado nunca gera segunda mensagem.
+
+**Baixa da nota (complemento da Fase 7):** `nota emitida OS <n> <número da NFS-e>` fecha a solicitação ativa como `AUTHORIZED` guardando o número (auditada); `cancelar nota OS <n>` marca `CANCELED` (cancela no emissor quando há id externo). Autorizadas e canceladas saem da lista `notas`.
+
 ## Verificação isolada
 
 ```sh

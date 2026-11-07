@@ -1,29 +1,28 @@
-# Fase 7 — Fluxo fiscal plugável (2026-11-05)
+# Fase 8 — Relatórios, automações e baixa de nota (2026-11-07)
 
 ## O que mudou
 
-- Porta fiscal `InvoiceProvider` virou fluxo de conversa determinístico:
-  - `emitir NF OS <n> <código>` — resumo → confirmação → solicitação.
-  - `notas` — solicitações não concluídas.
-- `InvoiceRequestInput` ganhou `externalReference` (`OS-<n>-NF<seq>`, sequência por OS) e a porta ganhou `findByExternalReference` — reconciliação obrigatória após falha, igual à porta de cobrança. Sem confirmação do emissor, a solicitação fica `NEEDS_REVIEW` com `last_error`.
-- Adapter `manual` (referência): toda solicitação → `NEEDS_REVIEW` para emissão humana no Portal Nacional. `INVOICE_PROVIDER=none` (padrão) responde determinístico sem criar nada.
-- Regras no domínio: só OS `CONFIRMADA` com valor; CPF/CNPJ do tomador obrigatório (orienta `cpf`); uma solicitação ativa por OS/provedor deduplica novas emissões.
-- Auditoria `REQUEST_INVOICE` (READY_FOR_APPROVAL → status do adapter) e `REQUEST_INVOICE_REVIEW` no caminho incerto.
+- **Relatórios sob demanda:** `fechamento` (dia) e `relatorio semanal`/`relatório semanal` (semana, segunda→hoje). Corpos montados 100% em SQL: OS confirmadas, recebido, cobrado (semanal), cobranças abertas + vencidas — centavos inteiros, janela de datas em America/Sao_Paulo.
+- **Alertas** nos dois relatórios, só quando pende algo: OS incompletas de dias anteriores, notas fiscais não concluídas (com referência `OS-n-NFk`) e materiais no mínimo (`saldo/mínimo unidade`).
+- **Agendamento no `/automation/tick`:** a partir de `REPORT_DAILY_HOUR` (default 18, SP) envia o fechamento do dia; em `REPORT_WEEKLY_DAY` (default segunda) também o semanal. `REPORTS_ENABLED=false` desliga (default `true`). Idempotência: `report_deliveries` (`UNIQUE(kind, period_key)`, migração 202611070001) + `dedup_key` — tick duplicado/reinício não duplica.
+- **Baixa de nota (complemento Fase 7):** `nota emitida OS <n> <número NFS-e>` → `AUTHORIZED` com número em `payload.nfsNumber` (auditoria `INVOICE_AUTHORIZED`); `cancelar nota OS <n>` → `CANCELED` (chama `provider.cancel` quando há id externo). Uso incorreto e OS sem solicitação respondem determinístico.
+- Tick responde `reports` na contagem.
 
 ## Arquivos
 
-- `core-api/src/domain.ts` — bloco "Emissão fiscal (Fase 7)", step `INVOICE_CONFIRM`, payload `invoice*`, despacho `emitir NF|notas`.
-- `core-api/src/providers/invoices/types.ts` + `manual.ts` — contrato estendido.
-- `core-api/test/integration.ts` — helpers `invoices()` + 2 cenários (manual happy path/dedup/aborto; none e OS inválidas).
-- README — seção "Emissão fiscal (Fase 7)".
+- `core-api/prisma/migrations/202611070001_reports/` + `ReportDelivery` no schema.
+- `core-api/src/config.ts` — `REPORTS_ENABLED`, `REPORT_DAILY_HOUR`, `REPORT_WEEKLY_DAY`.
+- `core-api/src/domain.ts` — seção "Relatórios e automações", `settleInvoiceAuthorized`, `cancelInvoiceRequest`, despacho estendido.
+- `core-api/src/app.ts` — `runScheduledReports` no tick.
+- `core-api/test/integration.ts` — 3 cenários novos; harness roda com `REPORTS_ENABLED=false` por padrão (suite não depende da hora do dia); `reset()` trunca `report_deliveries`.
+- README (seção Fase 8), `.env.example`, CHANGELOG 0.6.0.
 
 ## Decisões
 
-- NFS-e continua objeto independente da cobrança (pode emitir sem pagamento).
-- Código de serviço sempre digitado pelo operador — nunca fixado em código (IBS/CBS 2027).
-- Sem migração de banco: `invoices` já comportava o fluxo (payload jsonb + status).
+- Semanal define seu período pela segunda-feira da semana corrente (`period_key = W:<segunda ISO>`) — sem dependência de lib de ISO-week.
+- Alertas são estado atual (não histórico): os mesmos aparecem no diário e no semanal.
+- A política de envio é só env + tabela de entregas: sem cron novo no n8n, tudo no tick que já existia.
 
 ## Verificação
 
-- `npm run verify`: 52 cenários PASS + VERIFY PASS (commit 94a5198).
-- Smoke real (WhatsApp, produção): `emitir NF OS 4 1.02` → confirmação → `NEEDS_REVIEW` com referência `OS-4-NF1`; `notas` lista `OS 000004 · NEEDS_REVIEW · manual`; banco confirma payload (20000 cents) e auditoria `REQUEST_INVOICE`.
+- `npx tsc --noEmit` OK; `npm run verify` e smoke real pendentes no deploy desta fase.

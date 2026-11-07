@@ -2,7 +2,7 @@ import Fastify from 'fastify';
 import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { config, type Config } from './config.js';
-import { processMessage, queueNotice } from './domain.js';
+import { dailyCloseBody, mondayOf, processMessage, queueNotice, spNowParts, weeklyReportBody } from './domain.js';
 import { validHmac, sendWaha, SendFailure } from './waha.js';
 import { formatMoney, osLabel } from './types.js';
 import { getBillingProvider } from './providers/registry.js';
@@ -344,6 +344,43 @@ async function sweepOverdueCharges(prisma: PrismaClient, cfg: Config, operator: 
   });
 }
 
+// ===== Fase 8: relatórios agendados no tick =====
+//
+// A partir de REPORT_DAILY_HOUR (America/Sao_Paulo) o tick envia o
+// fechamento do dia; no REPORT_WEEKLY_DAY, também o semanal. O INSERT em
+// report_deliveries com ON CONFLICT DO NOTHING decide de forma atômica se o
+// período ainda não foi enviado — tick duplicado ou Core reiniciado no meio
+// nunca gera segunda mensagem (a dedup_key da outbox reforça).
+async function runScheduledReports(prisma: PrismaClient, cfg: Config, operator: OperatorRow): Promise<number> {
+  if (cfg.REPORTS_ENABLED !== 'true') return 0;
+  const { date, hour, weekday } = spNowParts();
+  let queued = 0;
+  if (hour >= cfg.REPORT_DAILY_HOUR) {
+    const inserted = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      `INSERT INTO report_deliveries(kind, period_key) VALUES('DAILY_CLOSE', $1)
+       ON CONFLICT (kind, period_key) DO NOTHING RETURNING id`,
+      date,
+    );
+    if (inserted[0]) {
+      await queueNotice(prisma, operator.id, cfg.OPERATOR_LID, await dailyCloseBody(prisma, date), `report:DAILY_CLOSE:${date}`);
+      queued += 1;
+    }
+  }
+  if (weekday === cfg.REPORT_WEEKLY_DAY && hour >= cfg.REPORT_DAILY_HOUR) {
+    const weekKey = `W:${mondayOf(date)}`;
+    const inserted = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      `INSERT INTO report_deliveries(kind, period_key) VALUES('WEEKLY', $1)
+       ON CONFLICT (kind, period_key) DO NOTHING RETURNING id`,
+      weekKey,
+    );
+    if (inserted[0]) {
+      await queueNotice(prisma, operator.id, cfg.OPERATOR_LID, await weeklyReportBody(prisma, mondayOf(date), date), `report:WEEKLY:${weekKey}`);
+      queued += 1;
+    }
+  }
+  return queued;
+}
+
 export async function buildApp(overrides: Partial<Config> = {}) {
   const cfg = { ...config(), ...overrides };
   // Fail-fast no boot: BILLING_PROVIDER=asaas sem credencial é erro de
@@ -467,10 +504,11 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     if (!operator) throw new Error('POC operator was not created');
     const billingProcessed = await processBillingEvents(prisma, cfg, operator);
     const overdue = await sweepOverdueCharges(prisma, cfg, operator);
-    if (billingProcessed > 0 || overdue > 0) {
+    const reports = await runScheduledReports(prisma, cfg, operator);
+    if (billingProcessed > 0 || overdue > 0 || reports > 0) {
       sent += await deliver(prisma, cfg);
     }
-    return { processed, sent, billingProcessed, overdue };
+    return { processed, sent, billingProcessed, overdue, reports };
   });
 
   app.addHook('onClose', async () => prisma.$disconnect());

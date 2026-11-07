@@ -1292,6 +1292,26 @@ async function executeInvoiceRequest(
 async function handleInvoiceCommand(
   tx: Tx, message: MessageRow, body: string, replyTo: string, cfg: Config,
 ): Promise<void> {
+  const settle = /^nota\s+emitida\s+OS\s+(\d+)\s+(\d{1,32})$/i.exec(body);
+  if (settle) {
+    await settleInvoiceAuthorized(tx, message, replyTo, Number(settle[1]), settle[2]!);
+    return;
+  }
+  const drop = /^cancelar\s+nota\s+OS\s+(\d+)$/i.exec(body);
+  if (drop) {
+    await cancelInvoiceRequest(tx, message, replyTo, cfg, Number(drop[1]));
+    return;
+  }
+  if (/^nota emitida\b/i.test(body)) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      'Use: nota emitida OS <número> <número da NFS-e>. Ex.: nota emitida OS 3 1024.', 'invoice-settle-usage');
+    return;
+  }
+  if (/^cancelar nota\b/i.test(body)) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      'Use: cancelar nota OS <número>. Ex.: cancelar nota OS 3.', 'invoice-cancel-usage');
+    return;
+  }
   if (/^notas$/i.test(body)) {
     const rows = await tx.$queryRawUnsafe<Array<{ number: number; customer: string; status: string; provider: string }>>(
       `SELECT so.number, c.name AS customer, i.status, i.provider
@@ -1333,6 +1353,71 @@ async function handleInvoiceCommand(
   await queueReply(tx, message.operator_id, message.id, replyTo,
     `Solicitar emissão fiscal da ${osLabel(order.number)} para ${order.customer}, ${formatMoney(order.amount_cents)}, código ${issue[2]}? Responda sim ou cancelar.`,
     'invoice-confirm');
+}
+
+// `nota emitida OS <n> <número>`: o operador registrou a NFS-e no Portal
+// Nacional (adapter manual) ou ela foi autorizada no emissor — fecha a
+// solicitação ativa como AUTHORIZED guardando o número da nota.
+async function settleInvoiceAuthorized(
+  tx: Tx, message: MessageRow, replyTo: string, osNumber: number, nfsNumber: string,
+): Promise<void> {
+  const rows = await tx.$queryRawUnsafe<Array<{ id: string; status: string; number: number }>>(
+    `SELECT i.id, i.status, so.number
+       FROM invoices i JOIN service_orders so ON so.id=i.service_order_id
+      WHERE so.number=$1 AND i.status NOT IN ('AUTHORIZED','CANCELED')
+      ORDER BY i.created_at DESC LIMIT 1`,
+    osNumber,
+  );
+  const invoice = rows[0];
+  if (!invoice) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Não há solicitação fiscal ativa para a ${osLabel(osNumber)}.`, 'invoice-settle-none');
+    return;
+  }
+  const changed = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `UPDATE invoices
+        SET status='AUTHORIZED', updated_at=now(),
+            payload = jsonb_set(COALESCE(payload, '{}'::jsonb), '{nfsNumber}', to_jsonb($2::text))
+      WHERE id=$1::uuid AND status NOT IN ('AUTHORIZED','CANCELED') RETURNING id`,
+    invoice.id, nfsNumber,
+  );
+  if (!changed[0]) throw new Error('INVOICE_SETTLE_STATE_CHANGED');
+  await audit(tx, message.operator_id, message.id, 'invoice', invoice.id, 'INVOICE_AUTHORIZED', invoice.status, 'AUTHORIZED', nfsNumber);
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Nota da ${osLabel(invoice.number)} registrada como emitida (nº ${nfsNumber}).`, 'invoice-settled');
+}
+
+// `cancelar nota OS <n>`: desiste da solicitação ativa (cancela no emissor
+// quando há id externo e o adapter configurado é o mesmo).
+async function cancelInvoiceRequest(
+  tx: Tx, message: MessageRow, replyTo: string, cfg: Config, osNumber: number,
+): Promise<void> {
+  const rows = await tx.$queryRawUnsafe<Array<{ id: string; status: string; number: number; provider: string; provider_invoice_id: string | null }>>(
+    `SELECT i.id, i.status, i.provider, i.provider_invoice_id, so.number
+       FROM invoices i JOIN service_orders so ON so.id=i.service_order_id
+      WHERE so.number=$1 AND i.status NOT IN ('AUTHORIZED','CANCELED')
+      ORDER BY i.created_at DESC LIMIT 1`,
+    osNumber,
+  );
+  const invoice = rows[0];
+  if (!invoice) {
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `Não há solicitação fiscal ativa para a ${osLabel(osNumber)}.`, 'invoice-cancel-none');
+    return;
+  }
+  const provider = getInvoiceProvider(cfg);
+  if (invoice.provider_invoice_id && provider && provider.name === invoice.provider) {
+    await provider.cancel(invoice.provider_invoice_id);
+  }
+  const changed = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `UPDATE invoices SET status='CANCELED', updated_at=now()
+      WHERE id=$1::uuid AND status NOT IN ('AUTHORIZED','CANCELED') RETURNING id`,
+    invoice.id,
+  );
+  if (!changed[0]) throw new Error('INVOICE_CANCEL_STATE_CHANGED');
+  await audit(tx, message.operator_id, message.id, 'invoice', invoice.id, 'INVOICE_CANCELED', invoice.status, 'CANCELED', 'operador');
+  await queueReply(tx, message.operator_id, message.id, replyTo,
+    `Solicitação fiscal da ${osLabel(invoice.number)} cancelada.`, 'invoice-canceled');
 }
 
 // ===== Cobrança (Fase 6) =====
@@ -2304,6 +2389,149 @@ async function handleBillingStep(
   return false;
 }
 
+// ===== Relatórios e automações (Fase 8) =====
+//
+// Fechamento diário e relatório semanal nascem de SQL puro (centavos
+// inteiros, datas em America/Sao_Paulo) e são entregues pela outbox:
+// sob demanda (`fechamento`, `relatorio semanal`) ou agendados no
+// /automation/tick (report_deliveries decide "já enviado" por período).
+
+/** Agora em America/Sao_Paulo: date ISO, hora 0-23 e dia da semana 0-6. */
+export function spNowParts(): { date: string; hour: number; weekday: number } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Sao_Paulo',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', hour12: false, weekday: 'short',
+  }).formatToParts(new Date());
+  const pick = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
+  const date = `${pick('year')}-${pick('month')}-${pick('day')}`;
+  const hour = Number(pick('hour')) % 24;
+  const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(pick('weekday'));
+  return { date, hour, weekday };
+}
+
+/** Segunda-feira (ISO) da semana do dia informado. */
+export function mondayOf(dayIso: string): string {
+  const date = new Date(`${dayIso}T12:00:00Z`);
+  const weekday = date.getUTCDay();
+  date.setUTCDate(date.getUTCDate() - ((weekday + 6) % 7));
+  return date.toISOString().slice(0, 10);
+}
+
+const brDay = (iso: string) =>
+  new Date(`${iso}T12:00:00Z`).toLocaleDateString('pt-BR', { timeZone: 'UTC' });
+
+type TotalsRow = { count: bigint; total: bigint };
+
+async function dayTotals(tx: Tx, sql: string, from: string, to: string): Promise<TotalsRow> {
+  return (await tx.$queryRawUnsafe<TotalsRow[]>(sql, from, to))[0]!;
+}
+
+// Cobranças abertas agora (estado, não período) — aparece nos dois relatórios.
+async function openChargesLine(tx: Tx): Promise<string> {
+  const rows = await tx.$queryRawUnsafe<Array<{ open: bigint; overdue: bigint; total: bigint }>>(
+    `SELECT count(*) AS open,
+            count(*) FILTER (WHERE status='OVERDUE') AS overdue,
+            COALESCE(sum(value_cents), 0) AS total
+       FROM charges WHERE status IN ('PENDING','OVERDUE')`,
+  );
+  const row = rows[0]!;
+  const overdue = Number(row.overdue);
+  return `Cobranças abertas: ${Number(row.open)} · ${formatMoney(Number(row.total))}${overdue > 0 ? ` (${overdue} vencida${overdue > 1 ? 's' : ''})` : ''}`;
+}
+
+// Alertas de estado (atuais, não do período): OS incompletas antigas,
+// notas fiscais pendentes e estoque no mínimo. Retorna '' se nada pende.
+async function alertsSection(tx: Tx, todayIso: string): Promise<string> {
+  const parts: string[] = [];
+  const incomplete = await tx.$queryRawUnsafe<Array<{ number: number; day: string }>>(
+    `SELECT number, to_char(created_at AT TIME ZONE 'America/Sao_Paulo', 'DD/MM') AS day
+       FROM service_orders
+      WHERE status IN ('AGUARDANDO_DADOS','AGUARDANDO_CONFIRMACAO')
+        AND (created_at AT TIME ZONE 'America/Sao_Paulo')::date < $1::date
+      ORDER BY number LIMIT 5`,
+    todayIso,
+  );
+  if (incomplete.length > 0) {
+    parts.push(`OS incompletas: ${incomplete.map((row) => `${osLabel(row.number)} (de ${row.day})`).join(', ')}`);
+  }
+  const fiscal = await tx.$queryRawUnsafe<Array<{ number: number; status: string; ref: string }>>(
+    `SELECT so.number, i.status, COALESCE(i.payload->>'externalReference', '—') AS ref
+       FROM invoices i JOIN service_orders so ON so.id=i.service_order_id
+      WHERE i.status NOT IN ('AUTHORIZED','CANCELED')
+      ORDER BY i.created_at LIMIT 5`,
+  );
+  if (fiscal.length > 0) {
+    parts.push(`Notas fiscais pendentes: ${fiscal.map((row) => `${osLabel(row.number)} ${row.status} (${row.ref})`).join(', ')}`);
+  }
+  const low = await tx.$queryRawUnsafe<Array<{ name: string; quantity: string; min_quantity: string; unit: string }>>(
+    `SELECT name, quantity::text, min_quantity::text, unit FROM inventory_items
+      WHERE min_quantity IS NOT NULL AND quantity <= min_quantity
+      ORDER BY name LIMIT 8`,
+  );
+  if (low.length > 0) {
+    parts.push(`Estoque mínimo: ${low.map((row) => `${row.name} ${formatQty(row.quantity)}/${formatQty(row.min_quantity)} ${row.unit}`).join(', ')}`);
+  }
+  return parts.length > 0 ? `\n${parts.join('\n')}` : '';
+}
+
+export async function dailyCloseBody(tx: Tx, dayIso: string): Promise<string> {
+  const orders = await dayTotals(tx,
+    `SELECT count(*) AS count, COALESCE(sum(amount_cents), 0) AS total
+       FROM service_orders
+      WHERE status='CONFIRMADA' AND (confirmed_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN $1::date AND $2::date`,
+    dayIso, dayIso);
+  const receipts = await dayTotals(tx,
+    `SELECT count(*) AS count, COALESCE(sum(paid_value_cents), 0) AS total
+       FROM charges
+      WHERE status='RECEIVED' AND (updated_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN $1::date AND $2::date`,
+    dayIso, dayIso);
+  const alerts = await alertsSection(tx, dayIso);
+  return `Fechamento ${brDay(dayIso)}\n` +
+    `OS confirmadas: ${Number(orders.count)} · ${formatMoney(Number(orders.total))}\n` +
+    `Recebido: ${Number(receipts.count)} · ${formatMoney(Number(receipts.total))}\n` +
+    `${await openChargesLine(tx)}${alerts}`;
+}
+
+export async function weeklyReportBody(tx: Tx, mondayIso: string, todayIso: string): Promise<string> {
+  const orders = await dayTotals(tx,
+    `SELECT count(*) AS count, COALESCE(sum(amount_cents), 0) AS total
+       FROM service_orders
+      WHERE status='CONFIRMADA' AND (confirmed_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN $1::date AND $2::date`,
+    mondayIso, todayIso);
+  const receipts = await dayTotals(tx,
+    `SELECT count(*) AS count, COALESCE(sum(paid_value_cents), 0) AS total
+       FROM charges
+      WHERE status='RECEIVED' AND (updated_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN $1::date AND $2::date`,
+    mondayIso, todayIso);
+  const charged = await dayTotals(tx,
+    `SELECT count(*) AS count, COALESCE(sum(value_cents), 0) AS total
+       FROM charges
+      WHERE (created_at AT TIME ZONE 'America/Sao_Paulo')::date BETWEEN $1::date AND $2::date`,
+    mondayIso, todayIso);
+  const alerts = await alertsSection(tx, todayIso);
+  return `Relatório semanal ${brDay(mondayIso)}–${brDay(todayIso)}\n` +
+    `OS confirmadas: ${Number(orders.count)} · ${formatMoney(Number(orders.total))}\n` +
+    `Cobrado: ${Number(charged.count)} · ${formatMoney(Number(charged.total))}\n` +
+    `Recebido: ${Number(receipts.count)} · ${formatMoney(Number(receipts.total))}\n` +
+    `${await openChargesLine(tx)}${alerts}`;
+}
+
+// `fechamento` e `relatorio semanal` sob demanda. Retorna true quando tratou.
+async function handleReportCommand(tx: Tx, message: MessageRow, body: string, replyTo: string): Promise<boolean> {
+  if (/^fechamento$/i.test(body)) {
+    const { date } = spNowParts();
+    await queueReply(tx, message.operator_id, message.id, replyTo, await dailyCloseBody(tx, date), 'report-daily');
+    return true;
+  }
+  if (/^relat[óo]rio\s+semanal$/i.test(body)) {
+    const { date } = spNowParts();
+    await queueReply(tx, message.operator_id, message.id, replyTo, await weeklyReportBody(tx, mondayOf(date), date), 'report-weekly');
+    return true;
+  }
+  return false;
+}
+
 export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Promise<void> {
   const messages = await tx.$queryRawUnsafe<MessageRow[]>(
     `SELECT m.id, m.message_id, m.operator_id, m.reply_to, m.body, m.has_media,
@@ -2358,7 +2586,8 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
   }
   if (!hasState && await handleCustomerCommand(tx, message, body, replyTo)) return;
   if (!hasState && await handleOrderLifecycleCommand(tx, message, body, replyTo)) return;
-  if (!hasState && /^(emitir\s+NF|notas)\b/i.test(body)) {
+  if (!hasState && await handleReportCommand(tx, message, body, replyTo)) return;
+  if (!hasState && /^(emitir\s+NF|notas|nota\s+emitida|cancelar\s+nota)\b/i.test(body)) {
     await handleInvoiceCommand(tx, message, body, replyTo, cfg);
     return;
   }
