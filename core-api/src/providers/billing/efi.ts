@@ -123,10 +123,14 @@ export class EfiBillingProvider implements BillingProvider {
     return token;
   }
 
-  private async call(method: string, path: string, payload: Json | null): Promise<{ status: number; body: Json | null }> {
+  private async call(
+    method: string, path: string, payload: Json | null, extraHeaders: Record<string, string> = {},
+  ): Promise<{ status: number; body: Json | null }> {
     const token = await this.accessToken();
     return efiFetch(this.base(), path, method, {
-      authorization: `Bearer ${token}`, ...(payload === null ? {} : { 'content-type': 'application/json' }),
+      authorization: `Bearer ${token}`,
+      ...(payload === null ? {} : { 'content-type': 'application/json' }),
+      ...extraHeaders,
     }, payload === null ? null : JSON.stringify(payload), TIMEOUT_MS, this.mTls);
   }
 
@@ -188,15 +192,49 @@ export class EfiBillingProvider implements BillingProvider {
   }
 
   /**
-   * Webhook Pix da Efí: POST com {pix: [{endToEndId, txid, valor, ...}]}.
-   * Sem header de auth — o token viaja na query da URL cadastrada
-   * (?token=...), comparado em constant-time.
+   * Cadastra o webhook Pix na Efí para a chave configurada. Fica fora da
+   * porta: é operação de instalação, específica da Efí.
+   *
+   * - URL cadastrada com `?token=<EFI_WEBHOOK_TOKEN>&ignorar=`: o token é a
+   *   autenticação (a Efí não envia header customizado) e `ignorar=` impede
+   *   a Efí de acrescentar `/pix` ao caminho — a rota real é
+   *   /webhooks/billing/efi.
+   * - Header `x-skip-mtls-checking: true`: sem ele a Efí exige, já no
+   *   cadastro, que o servidor público valide o certificado de cliente dela —
+   *   o que um Cloudflare Tunnel/proxy comum não faz. Com o skip, a
+   *   autenticação fica a cargo do token na URL.
+   * Retorna a URL cadastrada com o token mascarado (segura para log).
+   */
+  async registerWebhook(publicBaseUrl: string): Promise<string> {
+    const route = new URL('/webhooks/billing/efi', publicBaseUrl);
+    if (route.protocol !== 'https:') {
+      throw new Error('EFI_WEBHOOK_URL_NOT_HTTPS: a Efí só aceita webhook com HTTPS');
+    }
+    const registered = `${route.href}?token=${encodeURIComponent(this.cfg.EFI_WEBHOOK_TOKEN)}&ignorar=`;
+    const response = await this.call(
+      'PUT', `/v2/webhook/${encodeURIComponent(this.cfg.EFI_PIX_KEY)}`, { webhookUrl: registered },
+      { 'x-skip-mtls-checking': 'true' },
+    );
+    if (response.status !== 200 && response.status !== 201) {
+      const reason = typeof response.body?.mensagem === 'string' ? response.body.mensagem : 'sem detalhe';
+      throw new Error(`EFI_WEBHOOK_REGISTER_FAILED(${response.status}): ${reason}`);
+    }
+    return `${route.href}?token=***&ignorar=`;
+  }
+
+  /**
+   * Webhook Pix da Efí: POST {pix: [{endToEndId, txid, valor, ...}, ...]}.
+   * Autenticação: token na query (?token=...), constant-time. Cada entrada é
+   * um evento; só vira RECEIVED o que é recebimento de cobrança — Pix sem
+   * txid (cobrança estática/envio) e entradas com `devolucoes` (devolução de
+   * valor já pago) são ignorados. Corpos sem `pix` (notificação de teste do
+   * cadastro, `info` de recebimento recusado) devolvem lista vazia.
    */
   validateAndNormalizeWebhook(
     _headers: Record<string, string | string[] | undefined>,
     query: Record<string, string | string[] | undefined>,
     rawBody: unknown,
-  ): NormalizedBillingEvent | null {
+  ): NormalizedBillingEvent[] {
     const provided = Array.isArray(query.token) ? query.token[0] : query.token;
     const expected = this.cfg.EFI_WEBHOOK_TOKEN;
     const a = Buffer.from(String(provided ?? ''));
@@ -204,23 +242,25 @@ export class EfiBillingProvider implements BillingProvider {
     if (!expected || a.length !== b.length || !timingSafeEqual(a, b)) {
       throw new WebhookAuthError('invalid efi webhook token');
     }
-    const entries = typeof rawBody === 'object' && rawBody !== null && 'pix' in rawBody
-      && Array.isArray(rawBody.pix) ? rawBody.pix : null;
-    if (!entries || entries.length === 0) return null;
-    const entry: unknown = entries[0];
-    const field = (name: string): unknown =>
-      typeof entry === 'object' && entry !== null && name in entry
-        ? (entry as Record<string, unknown>)[name] : undefined;
-    const txid = field('txid');
-    const endToEndId = field('endToEndId');
-    const providerChargeId = typeof txid === 'string' ? txid : null;
-    const providerEventId = typeof endToEndId === 'string' ? endToEndId : null;
-    if (!providerChargeId || !providerEventId) return null;
-    return {
-      type: 'RECEIVED',
-      providerChargeId,
-      providerEventId,
-      paidValueCents: valueToCents(field('valor')),
-    };
+    const entries: unknown[] = typeof rawBody === 'object' && rawBody !== null && 'pix' in rawBody
+      && Array.isArray(rawBody.pix) ? rawBody.pix : [];
+    const events: NormalizedBillingEvent[] = [];
+    for (const entry of entries) {
+      const field = (name: string): unknown =>
+        typeof entry === 'object' && entry !== null && name in entry
+          ? (entry as Record<string, unknown>)[name] : undefined;
+      const txid = field('txid');
+      const endToEndId = field('endToEndId');
+      const refunds = field('devolucoes');
+      if (Array.isArray(refunds) && refunds.length > 0) continue;
+      if (typeof txid !== 'string' || typeof endToEndId !== 'string') continue;
+      events.push({
+        type: 'RECEIVED',
+        providerChargeId: txid,
+        providerEventId: endToEndId,
+        paidValueCents: valueToCents(field('valor')),
+      });
+    }
+    return events;
   }
 }

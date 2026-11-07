@@ -5,6 +5,8 @@ import type { AddressInfo } from 'node:net';
 import { PrismaClient } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
+import { config } from '../src/config.js';
+import { EfiBillingProvider } from '../src/providers/billing/efi.js';
 
 const databaseUrl = process.env.DATABASE_URL;
 assert.ok(databaseUrl, 'DATABASE_URL must identify the migrated, disposable PostgreSQL test database');
@@ -567,9 +569,12 @@ const efiCobs: EfiCob[] = [];
 const efiCalls: Array<{ method: string; path: string; body: unknown }> = [];
 let efiTokenRequests = 0;
 let efiCreateThen500 = false;
+// Cadastros recebidos em PUT /v2/webhook/:chave (contrato do skip-mTLS).
+const efiWebhookRegistrations: Array<{ chave: string; webhookUrl: string; skipMtls: boolean }> = [];
 function efiReset() {
   efiCobs.length = 0;
   efiCalls.length = 0;
+  efiWebhookRegistrations.length = 0;
   efiTokenRequests = 0;
   efiCreateThen500 = false;
 }
@@ -604,12 +609,24 @@ const efiFake = http.createServer((request, response) => {
       }
       return efiReply(response, 200, { access_token: `efi-token-${efiTokenRequests}`, token_type: 'Bearer', expires_in: 3600 });
     }
+    const authorized = request.headers.authorization !== undefined && /^Bearer efi-token-\d+$/.test(request.headers.authorization);
+    // Cadastro do webhook Pix. A Efí real valida mTLS no ato: sem o header
+    // x-skip-mtls-checking o cadastro de um servidor atrás de proxy/túnel falha.
+    const webhookMatch = /^\/v2\/webhook\/([^/]+)$/.exec(path);
+    if (webhookMatch && request.method === 'PUT') {
+      if (!authorized) return efiReply(response, 401, { error: 'unauthorized' });
+      const input = body as { webhookUrl?: string } | null;
+      const skipMtls = request.headers['x-skip-mtls-checking'] === 'true';
+      efiWebhookRegistrations.push({ chave: decodeURIComponent(webhookMatch[1]!), webhookUrl: input?.webhookUrl ?? '', skipMtls });
+      if (!skipMtls) {
+        return efiReply(response, 400, { nome: 'webhook_invalido', mensagem: 'A autenticação de TLS mútuo não está configurada na URL informada' });
+      }
+      return efiReply(response, 200, { webhookUrl: input?.webhookUrl });
+    }
     const cobMatch = /^\/v2\/cob\/([A-Za-z0-9]+)$/.exec(path);
     if (!cobMatch) return efiReply(response, 404, { error: 'unhandled' });
     const txid = cobMatch[1]!;
-    if (request.headers.authorization === undefined || !/^Bearer efi-token-\d+$/.test(request.headers.authorization)) {
-      return efiReply(response, 401, { error: 'unauthorized' });
-    }
+    if (!authorized) return efiReply(response, 401, { error: 'unauthorized' });
     efiCalls.push({ method: request.method ?? '', path, body });
     if (request.method === 'PUT') {
       const input = body as { valor?: { original?: string }; chave?: string; solicitacaoPagador?: string };
@@ -2656,6 +2673,75 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     // Sem cobrança ativa: novo cancelamento não fala com o provedor.
     assert.match((await inbound(`cancelar cobrança OS ${order.number}`)).text, /Não há cobrança ativa/);
     assert.equal(efiCallsTo('PATCH', '/v2/cob/').length, 1);
+  }],
+  ['efi webhook com vários pix baixa todos; devolução, Pix sem txid e corpos sem pix não geram evento', async () => {
+    await restartAppWith(efiEnv());
+    const first = await confirmOrder('Servico efi lote um', 'Cliente Efi Lote Um', '150');
+    await cobrarPixConfirm(first.number);
+    const second = await confirmOrder('Servico efi lote dois', 'Cliente Efi Lote Dois', '90');
+    await cobrarPixConfirm(second.number);
+    const [txidOne, txidTwo] = (await charges()).map((charge) => charge.provider_charge_id!);
+    // UMA chamada com dois recebimentos + uma devolução + um Pix sem txid:
+    // os dois recebimentos baixam; os demais são ignorados (nada de RECEIVED
+    // por devolução). A URL real da Efí chega com `ignorar=/pix` no fim.
+    const batch = {
+      pix: [
+        { endToEndId: 'E0000000020261107aaaa', txid: txidOne, valor: '150.00', horario: '2026-11-07T10:00:00.000Z' },
+        { endToEndId: 'E0000000020261107bbbb', txid: txidTwo, valor: '90.00', horario: '2026-11-07T10:00:01.000Z' },
+        {
+          endToEndId: 'E0000000020261107cccc', txid: txidOne, valor: '150.00',
+          devolucoes: [{ id: 'D1', rtrId: 'D0000000020261107cccc', valor: '150.00', status: 'DEVOLVIDO' }],
+        },
+        { endToEndId: 'E0000000020261107dddd', valor: '20.00', horario: '2026-11-07T10:00:02.000Z' },
+      ],
+    };
+    const url = `/webhooks/billing/efi?token=${EFI_TEST_WEBHOOK_TOKEN}&ignorar=%2Fpix`;
+    const sent = await request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch) });
+    assert.equal(sent.status, 200, sent.text);
+    assert.deepEqual((await billingEvents()).map((event) => [event.provider_event_id, event.event_type]), [
+      ['E0000000020261107aaaa', 'RECEIVED'],
+      ['E0000000020261107bbbb', 'RECEIVED'],
+    ]);
+    await tick();
+    assert.deepEqual((await charges()).map((charge) => [charge.status, charge.paid_value_cents]), [['RECEIVED', 15000], ['RECEIVED', 9000]]);
+    assert.deepEqual((await notices()).map((notice) => notice.body), [
+      'Cobrança OS 000001 recebida: R$ 150,00',
+      'Cobrança OS 000002 recebida: R$ 90,00',
+    ]);
+    // Reenvio do mesmo lote: dedup por endToEndId, sem novo aviso.
+    assert.equal((await request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch) })).status, 200);
+    await tick();
+    assert.equal((await billingEvents()).length, 2);
+    assert.equal((await notices()).length, 2);
+    // Notificação de teste do cadastro, `info` de recebimento recusado e corpo
+    // vazio: 200 sem persistir nada.
+    for (const body of [{}, { info: [{ status: 'RECEBIMENTO_RECUSADO', valor: '0.10' }] }, { pix: [] }]) {
+      const ignored = await efiWebhook(body, EFI_TEST_WEBHOOK_TOKEN);
+      assert.equal(ignored.status, 200);
+      assert.match(ignored.text, /"ignored":true/);
+    }
+    assert.equal((await billingEvents()).length, 2);
+  }],
+  ['efi cadastro do webhook: URL com token e ignorar=, header skip-mTLS e HTTPS obrigatório', async () => {
+    await restartAppWith(efiEnv());
+    const provider = new EfiBillingProvider(config());
+    const shown = await provider.registerWebhook('https://whatscobranca.example.com');
+    assert.equal(shown, 'https://whatscobranca.example.com/webhooks/billing/efi?token=***&ignorar=');
+    assert.ok(!shown.includes(EFI_TEST_WEBHOOK_TOKEN), 'o retorno (log) nunca carrega o token');
+    assert.deepEqual(efiWebhookRegistrations, [{
+      chave: 'pix-key-efi',
+      webhookUrl: `https://whatscobranca.example.com/webhooks/billing/efi?token=${EFI_TEST_WEBHOOK_TOKEN}&ignorar=`,
+      skipMtls: true,
+    }]);
+    // HTTP puro: recusado antes de qualquer chamada à Efí.
+    await assert.rejects(provider.registerWebhook('http://whatscobranca.example.com'), /EFI_WEBHOOK_URL_NOT_HTTPS/);
+    assert.equal(efiWebhookRegistrations.length, 1);
+    // A rota registrada é a que o servidor realmente expõe: o POST da Efí
+    // (com `ignorar=/pix` no fim) autentica pelo token e responde 200.
+    const probe = await request(`/webhooks/billing/efi?token=${EFI_TEST_WEBHOOK_TOKEN}&ignorar=%2Fpix`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(probe.status, 200);
   }],
 ];
 

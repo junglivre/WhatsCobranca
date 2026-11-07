@@ -47,8 +47,9 @@ export class ManualBillingProvider implements BillingProvider {
   /** Provedor manual não envia webhooks. */
   validateAndNormalizeWebhook(
     _headers: Record<string, string | string[] | undefined>,
+    _query: Record<string, string | string[] | undefined>,
     _rawBody: unknown,
-  ): NormalizedBillingEvent | null {
-    return null;
+  ): NormalizedBillingEvent[] {
+    return [];
   }
 }

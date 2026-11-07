@@ -496,7 +496,14 @@ async function processQuery(
   tx: Tx, operatorId: string, sourceMessageId: string, replyTo: string, body: string,
 ): Promise<boolean> {
   if (/^ajuda$/i.test(body)) {
-    await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Comandos: novo; OS <número>; mostra as OS do <nome>; o que fiz hoje?; corrigir valor <valor>; corrigir descrição <texto>; corrigir materiais; cancelar; material novo; entrada <qtd> <material>; ajustar <material> para <qtd>; devolver <qtd> <material> OS <n>; saldo <material>; estoque.', 'help');
+    await queueReply(tx, operatorId, sourceMessageId, replyTo, [
+      'Atendimento: novo; OS <n>; mostra as OS do <nome>; o que fiz hoje?; corrigir valor|descrição|materiais; cancelar; cancelar OS <n>.',
+      'Clientes: cliente <nome>; histórico <nome>; telefone <nome> <número>; email <nome> <endereço>; endereco <nome> | <rua>, <nº>, <bairro>, <cidade>/<UF>, <CEP>; cpf <nome> <documento>; autorizar <nome>; revogar <nome>.',
+      'Estoque: material novo; entrada <qtd> <material>; ajustar <material> para <qtd>; devolver <qtd> <material> OS <n>; saldo <material>; estoque.',
+      'Cobrança: cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]; cobranças; vencidas; recebi OS <n> <valor> [pix|dinheiro]; cancelar cobrança OS <n>.',
+      'Nota fiscal: emitir NF OS <n> <código>; notas; nota emitida OS <n> <número>; cancelar nota OS <n>.',
+      'Relatórios: fechamento; relatorio semanal.',
+    ].join('\n'), 'help');
     return true;
   }
   const os = body.match(/^OS\s+(\d+)$/i);

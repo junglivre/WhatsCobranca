@@ -465,22 +465,28 @@ export async function buildApp(overrides: Partial<Config> = {}) {
         parsed = null; // corpo inválido: adapter devolve null → 200 + ignored
       }
     }
-    let event: NormalizedBillingEvent | null;
+    let events: NormalizedBillingEvent[];
     try {
-      event = billing.validateAndNormalizeWebhook(request.headers, request.query as Record<string, string | string[] | undefined>, parsed);
+      events = billing.validateAndNormalizeWebhook(request.headers, request.query as Record<string, string | string[] | undefined>, parsed);
     } catch (error) {
       if (error instanceof WebhookAuthError) {
         return reply.code(401).send({ error: 'invalid_token' });
       }
       throw error;
     }
-    if (!event) return { accepted: true, ignored: true };
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO billing_events(provider, provider_event_id, event_type, payload)
-       VALUES($1, $2, $3, $4::jsonb)
-       ON CONFLICT (provider, provider_event_id) DO NOTHING`,
-      provider, event.providerEventId, event.type, JSON.stringify(event),
-    );
+    if (events.length === 0) return { accepted: true, ignored: true };
+    // Todos os eventos da chamada entram numa única transação: o provedor só
+    // recebe 200 quando TODOS foram persistidos (reenvio é seguro — dedup).
+    await prisma.$transaction(async (tx) => {
+      for (const event of events) {
+        await tx.$executeRawUnsafe(
+          `INSERT INTO billing_events(provider, provider_event_id, event_type, payload)
+           VALUES($1, $2, $3, $4::jsonb)
+           ON CONFLICT (provider, provider_event_id) DO NOTHING`,
+          provider, event.providerEventId, event.type, JSON.stringify(event),
+        );
+      }
+    });
     return { accepted: true };
   });
 

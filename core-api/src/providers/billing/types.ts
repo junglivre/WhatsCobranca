@@ -145,13 +145,15 @@ export interface BillingProvider {
 
   /**
    * Valida a autenticidade do webhook (token/assinatura) e normaliza.
-   * Lança WebhookAuthError se inválido. Retorna null quando o evento não
-   * se refere a uma cobrança (ex.: evento de transferência) — o caller
-   * responde 200 e ignora.
+   * Lança WebhookAuthError se inválido. Retorna lista vazia quando o corpo
+   * não traz nenhum evento de cobrança (ex.: transferência, notificação de
+   * teste do cadastro) — o caller responde 200 e ignora. Uma única chamada
+   * pode trazer VÁRIOS eventos (ex.: Efí agrupa Pix em `pix[]`); cada um
+   * vira uma linha deduplicada por `providerEventId`.
    */
   validateAndNormalizeWebhook(
     headers: Record<string, string | string[] | undefined>,
     query: Record<string, string | string[] | undefined>,
     rawBody: unknown,
-  ): NormalizedBillingEvent | null;
+  ): NormalizedBillingEvent[];
 }

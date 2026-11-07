@@ -37,7 +37,17 @@ services:
       ASAAS_API_KEY: ${ASAAS_API_KEY:-}
       ASAAS_BASE_URL: ${ASAAS_BASE_URL:-https://api-sandbox.asaas.com/v3}
       ASAAS_WEBHOOK_TOKEN: ${ASAAS_WEBHOOK_TOKEN:-}
+      EFI_CLIENT_ID: ${EFI_CLIENT_ID:-}
+      EFI_CLIENT_SECRET: ${EFI_CLIENT_SECRET:-}
+      EFI_PIX_KEY: ${EFI_PIX_KEY:-}
+      EFI_BASE_URL: ${EFI_BASE_URL:-https://api-sandbox.efipay.com.br}
+      EFI_WEBHOOK_TOKEN: ${EFI_WEBHOOK_TOKEN:-}
+      EFI_CERT_BASE64: ${EFI_CERT_BASE64:-}
+      EFI_KEY_BASE64: ${EFI_KEY_BASE64:-}
       INVOICE_PROVIDER: ${INVOICE_PROVIDER:-none}
+      REPORTS_ENABLED: ${REPORTS_ENABLED:-true}
+      REPORT_DAILY_HOUR: ${REPORT_DAILY_HOUR:-18}
+      REPORT_WEEKLY_DAY: ${REPORT_WEEKLY_DAY:-1}
     ports: ["127.0.0.1:8080:8080"]
     depends_on: {postgres: {condition: service_healthy}}
     healthcheck:

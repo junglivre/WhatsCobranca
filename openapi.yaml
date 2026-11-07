@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: WhatsCobranca POC1 Core API
   version: 0.1.0
-  description: Only POST /webhooks/waha may pass through the public webhook-only proxy.
+  description: Only POST /webhooks/waha and POST /webhooks/billing/{provider} may pass through the public webhook-only proxy.
 servers:
   - url: http://127.0.0.1:8080
 paths:
@@ -64,6 +64,53 @@ paths:
         '413': {description: Body exceeds configured limit (default 128 KiB)}
         '415': {description: Unsupported Content-Type; use application/json}
         '500': {description: Persistence unavailable or unexpected internal error; sender may retry}
+  /webhooks/billing/{provider}:
+    post:
+      summary: Persist authenticated billing-provider events (Asaas, Efí)
+      description: >-
+        Public route behind the webhook-only proxy; only the configured
+        BILLING_PROVIDER is served (other names return 404). Authentication is
+        provider-specific: Asaas sends the `asaas-access-token` header; Efí sends
+        no custom headers, so its URL is registered with `?token=<EFI_WEBHOOK_TOKEN>&ignorar=`
+        (`ignorar=` stops Efí from appending `/pix` to the path) and the token is
+        compared in constant time. One call may carry several events (Efí `pix[]`);
+        all are persisted in one transaction and deduplicated by
+        (provider, provider_event_id). Bodies with no charge event (registration
+        test, refunds, sent Pix) return 200 with ignored=true. Processing is
+        asynchronous in /automation/tick; 200 acknowledges persistence only.
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema: {type: string, enum: [asaas, efi]}
+        - in: query
+          name: token
+          required: false
+          schema: {type: string}
+          description: Efí only; shared secret registered in the webhook URL
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        '200':
+          description: Accepted, duplicate, or safely ignored
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [accepted]
+                properties:
+                  accepted: {type: boolean, enum: [true]}
+                  ignored: {type: boolean}
+        '401':
+          description: Missing or invalid provider token; nothing persisted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404': {description: Provider is not the configured BILLING_PROVIDER}
+        '500': {description: Persistence unavailable; sender may retry}
   /automation/tick:
     post:
       summary: Process durable inbox and publish eligible outbox messages

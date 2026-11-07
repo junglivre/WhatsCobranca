@@ -3,6 +3,8 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 umask 077
+# Contrato config.ts ↔ docker-compose.yml: falha cedo, antes de subir containers.
+node scripts/check-compose-env.mjs
 # Deliberately ignore .env and inherited operational configuration.
 export POSTGRES_DB=whatscobranca_verify POSTGRES_USER=whatscobranca
 export POSTGRES_PASSWORD=verify_password_please_change

@@ -4,7 +4,7 @@ Instruções para qualquer agente de IA (humano ou não) que for alterar este re
 
 ## O que este projeto é
 
-POC de um assistente de Ordens de Serviço via WhatsApp: WAHA (existente, não gerenciado por este repo) → webhook assinado → Core API (Fastify/TypeScript/Prisma) → PostgreSQL, com n8n só como acionador de um tick durável. Desde a Fase 4, notas de voz passam por Groq Whisper (STT) + Groq LLM (extração estruturada) e pré-preenchem o fluxo guiado — a gramática de TEXTO continua uma máquina de estados determinística, proposital. Sem estoque, cobrança (Asaas) ou emissão fiscal nesta fase.
+POC de um assistente de Ordens de Serviço via WhatsApp: WAHA (existente, não gerenciado por este repo) → webhook assinado → Core API (Fastify/TypeScript/Prisma) → PostgreSQL, com n8n só como acionador de um tick durável. Notas de voz passam por Groq Whisper (STT) + Groq LLM (extração estruturada) e pré-preenchem o fluxo guiado — a gramática de TEXTO continua uma máquina de estados determinística, proposital. O escopo inclui estoque (Fase 5), cobrança por adapters Asaas/Efí/manual (Fase 6), cadastro financeiro e cancelamento de OS (6.5), fluxo fiscal sobre a porta `InvoiceProvider` (7) e relatórios agendados (8).
 
 Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática de conversa descritas lá são a fonte de verdade do comportamento esperado.
 
@@ -29,7 +29,7 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 ## Convenções
 
 - Node.js 22, TypeScript estrito (`strict: true`), módulos ESM (`NodeNext`).
-- Sem HTTP interno entre módulos de domínio dentro do mesmo processo — `customer-service`/`service-order-service`/motor de conversa são chamadas de função direta, não rotas. Só existem três rotas HTTP reais: `GET /health`, `POST /webhooks/waha` (pública) e `POST /automation/tick` (privada).
+- Sem HTTP interno entre módulos de domínio dentro do mesmo processo — `customer-service`/`service-order-service`/motor de conversa são chamadas de função direta, não rotas. As rotas HTTP reais são `GET /health`, `POST /webhooks/waha` e `POST /webhooks/billing/:provider` (públicas, atrás do proxy webhook-only) e `POST /automation/tick` (privada). Contrato em `openapi.yaml`.
 - Testes (`core-api/test/integration.ts`) rodam contra PostgreSQL real e um provedor WAHA HTTP isolado — nunca contra a API WAHA de verdade. `npm run verify` sobe um projeto Compose inteiramente separado (`whatscobranca_verify`) com bancos e portas próprios; nunca toca dados operacionais.
 - Segredos só em `.env` (gitignorado, permissão 600). Nunca hardcode identidade real de operador, domínio ou chave de API em código, docs ou testes — use os placeholders já presentes (`00000000000000@lid`, `5511999999999@c.us`, `your-waha-instance.example.com`, sessão `default`).
 - Scripts (`scripts/*.sh`) usam `set -euo pipefail`, nunca removem volumes/bancos operacionais, e todo script de restauração/backup recusa sobrescrever destino existente.
@@ -52,6 +52,14 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - Notificação ao operador só em transição de status, com `dedup_key` `billing:<chargeId>:<status>` (webhook e sweep de vencidas compartilham a chave — nunca aviso duplo).
 - Dinheiro em `value_cents` integer; conversão para reais só dentro do adapter.
 - Credenciais (`ASAAS_API_KEY`, `ASAAS_WEBHOOK_TOKEN`) só no `.env` local, nunca em código, teste ou log de erro (erros do adapter truncam corpo e omitem headers).
+- Webhook de provedor devolve uma LISTA de eventos (`validateAndNormalizeWebhook(...): NormalizedBillingEvent[]`): um POST pode trazer vários (Efí `pix[]`). Todos entram na mesma transação, deduplicados por `(provider, provider_event_id)`; lista vazia = 200 `ignored`. Só recebimento vira `RECEIVED` — devolução (`devolucoes`) e Pix sem `txid` são ignorados.
+- Autenticação do webhook é por adapter: Asaas = header `asaas-access-token`; Efí = `?token=` na URL cadastrada (a Efí não envia header customizado), constante-time. O cadastro na Efí usa `?token=…&ignorar=` e o header `x-skip-mtls-checking: true` (`node dist/efi-register-webhook.js <url>`); a Efí NÃO é validada por mTLS atrás do túnel, então o token é a única camada — não o registre em logs.
+- Toda variável do schema de `core-api/src/config.ts` precisa estar no `environment` do `core-api` em `docker-compose.yml` (o Compose não repassa o `.env` inteiro). `scripts/check-compose-env.mjs` roda no início do `npm run verify` e falha se faltar alguma.
+
+## Invariantes fiscais e de relatórios (Fases 7 e 8)
+
+- `invoices` nasce `READY_FOR_APPROVAL` com `externalReference` (`OS-<n>-NF<seq>`) ANTES de chamar o emissor; falha de comunicação reconcilia por `findByExternalReference` e, sem confirmação, vira `NEEDS_REVIEW` — nunca se presume perda. Só `AUTHORIZED` significa "nota emitida" (`nota emitida OS <n> <número>`). Uma solicitação ativa por OS/provedor.
+- Relatórios (`fechamento`, `relatorio semanal`) são SQL puro, centavos inteiros, datas em America/Sao_Paulo. O envio agendado roda no `/automation/tick` e é idempotente por `report_deliveries(kind, period_key)` + `dedup_key` da outbox; `REPORTS_ENABLED=false` desliga o agendamento. O harness de teste roda com relatórios desligados por padrão para não depender da hora do dia.
 
 ## Invariantes de cadastro e cancelamento (Fase 6.5)
 

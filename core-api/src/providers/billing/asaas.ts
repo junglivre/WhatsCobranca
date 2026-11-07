@@ -165,7 +165,7 @@ export class AsaasBillingProvider implements BillingProvider {
     headers: Record<string, string | string[] | undefined>,
     _query: Record<string, string | string[] | undefined>,
     rawBody: unknown,
-  ): NormalizedBillingEvent | null {
+  ): NormalizedBillingEvent[] {
     const header = headers['asaas-access-token'];
     const token = Array.isArray(header) ? header[0] : header;
     if (token !== this.cfg.ASAAS_WEBHOOK_TOKEN) throw new WebhookAuthError();
@@ -175,7 +175,7 @@ export class AsaasBillingProvider implements BillingProvider {
       payment?: { id?: unknown; value?: unknown } | null;
     } | null;
     const paymentId = typeof body?.payment?.id === 'string' ? body.payment.id : null;
-    if (!paymentId) return null; // evento não relacionado a cobrança: caller responde 200 e ignora
+    if (!paymentId) return []; // evento não relacionado a cobrança: caller responde 200 e ignora
     const eventName = typeof body?.event === 'string' ? body.event : '';
     const type: BillingEventType = (() => {
       switch (eventName) {
@@ -192,11 +192,11 @@ export class AsaasBillingProvider implements BillingProvider {
       ? body.id
       : `${eventName}:${paymentId}`; // dedup determinístico quando o provedor omite o id do evento
     const value = body?.payment?.value;
-    return {
+    return [{
       providerEventId,
       providerChargeId: paymentId,
       type,
       paidValueCents: typeof value === 'number' ? Math.round(value * 100) : null,
-    };
+    }];
   }
 }

@@ -52,7 +52,7 @@ async function delivered(id) {
     assert.ok(found, 'Provider ledger must contain the exact persisted provider id');
     assert.equal(found.chatId, '00000000000000@lid');
     assert.equal(found.session, 'default');
-    assert.match(found.text, /Comandos:.*novo/s, 'The requested help must reach the provider');
+    assert.match(found.text, /Atendimento:.*novo/s, 'The requested help must reach the provider');
     return row;
   }, `n8n delivery of ${id}`);
 }

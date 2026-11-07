@@ -158,14 +158,29 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 - `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
 
+- `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas exige CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
+
 ### Adapter Efí Pay (`BILLING_PROVIDER=efi`)
 
-Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado deterministicamente da `externalReference` — `OS-12-C3` → 30 caracteres alfanuméricos). OAuth2 `client_credentials` com cache em memória; copia-e-cola vem do próprio corpo da cob; cancelamento é `PATCH` para `REMOVIDA_BY_USUARIO`; timeout/5xx reconcilia por `GET /v2/cob/{txid}` antes de qualquer reenvio. **Boleto não é suportado** — `cobrar OS n boleto` responde de forma determinística e a intenção fica `ERROR`.
+Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado deterministicamente da `externalReference` — `OS-12-C3` → 30 caracteres alfanuméricos). OAuth2 `client_credentials` com cache em memória; copia-e-cola vem do próprio corpo da cob; cancelamento é `PATCH` para `REMOVIDA_BY_USUARIO`; timeout/5xx reconcilia por `GET /v2/cob/{txid}` antes de qualquer reenvio. A cob expira às 23:59:59 do vencimento (piso 1h, teto 30 dias) — depois disso a Efí não aceita mais o pagamento. **Boleto não é suportado** — `cobrar OS n boleto` responde de forma determinística e a intenção fica `ERROR`.
 
-**Webhook Efí:** a Efí não envia headers customizáveis — cadastre a URL **com o token na query**: `https://SEU-DOMINIO/webhooks/billing/efi?token=<EFI_WEBHOOK_TOKEN>` (via `PUT /v2/webhook/{chave-pix}` com o mesmo valor). O payload `{pix:[{endToEndId, txid, valor}]}` é normalizado para `RECEIVED` com dedup por `endToEndId`.
+**Env:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_BASE_URL` (default sandbox `https://api-sandbox.efipay.com.br`), `EFI_WEBHOOK_TOKEN` (segredo longo e aleatório, ex.: `openssl rand -hex 32`); a API Pix da Efí exige mTLS — `EFI_CERT_BASE64`/`EFI_KEY_BASE64` (certificado `.p12` da aplicação convertido para PEM, em base64). O registry falha no boot se a configuração mínima faltar, e o `docker-compose.yml` repassa todas ao container.
 
-**Env:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_BASE_URL` (default sandbox), `EFI_WEBHOOK_TOKEN`; produção exige mTLS — `EFI_CERT_BASE64`/`EFI_KEY_BASE64` (certificado ICP-Brasil em base64). O registry falha no boot se a configuração mínima faltar. Não há cliente de teste real contra a Efí nesta POC: o adapter é coberto por um fake HTTP que espelha esses endpoints; validação em homologação da Efí depende das credenciais da conta.
-- `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas exige CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
+**Webhook — como a Efí funciona e como este projeto responde:**
+
+1. A Efí só aceita webhook **HTTPS** e, por padrão, exige que o seu servidor valide o certificado de cliente dela já no cadastro (mTLS). Um Cloudflare Tunnel/proxy comum não faz isso — por isso o cadastro usa o header `x-skip-mtls-checking: true` (opção oficial "skip-mTLS"). Sem ele o cadastro falha com *"A autenticação de TLS mútuo não está configurada na URL informada"*.
+2. Com o skip, **a autenticação é o token na URL** (a Efí não envia header customizado): a URL cadastrada é `https://SEU-DOMINIO/webhooks/billing/efi?token=<EFI_WEBHOOK_TOKEN>&ignorar=`. O `ignorar=` impede a Efí de acrescentar `/pix` ao caminho. O token fica visível em logs de acesso do proxy — trate-o como segredo e troque-o (editando o `.env` e recadastrando) se vazar. Opcionalmente restrinja no proxy/Cloudflare a origem ao IP da Efí (hoje `34.193.116.226`, conforme a documentação dela).
+3. Cadastro (uma vez, ou após trocar o token):
+
+```sh
+docker compose run --rm --no-deps core-api node dist/efi-register-webhook.js https://SEU-DOMINIO-PUBLICO
+```
+
+O comando usa as mesmas variáveis `EFI_*`, monta a URL acima, chama `PUT /v2/webhook/{chave}` e imprime a URL com o token mascarado. O proxy já encaminha `POST /webhooks/billing/<provedor>`; o 200 de teste que a Efí dispara no cadastro é respondido como `ignored`.
+
+**Eventos:** o payload `{pix:[{endToEndId, txid, valor}, …]}` pode trazer vários Pix por chamada — todos são persistidos numa transação e deduplicados por `endToEndId`. Só recebimento vira `RECEIVED`: devolução (`devolucoes`), Pix sem `txid` e notificações `info` (ex.: recebimento recusado) são respondidos com 200 e ignorados.
+
+**Limites desta integração:** o adapter é coberto por um fake HTTP que espelha os endpoints (OAuth, cob, webhook com a regra do skip-mTLS) — a validação contra a Efí **real** depende das credenciais da conta de homologação, e o mTLS de saída (`EFI_CERT_BASE64`/`EFI_KEY_BASE64`) só é exercitado nessa conta.
 
 ### Cadastro e ciclo de vida da OS (Fase 6.5)
 
@@ -248,7 +263,7 @@ O restore recusa o banco operacional, qualquer banco de sistema e **qualquer des
 
 ## Referência da API
 
-Ver [`openapi.yaml`](openapi.yaml) — três rotas: `GET /health`, `POST /webhooks/waha` (pública, atrás do proxy) e `POST /automation/tick` (privada, Bearer).
+Ver [`openapi.yaml`](openapi.yaml): `GET /health`, `POST /webhooks/waha` e `POST /webhooks/billing/{provider}` (públicas, atrás do proxy) e `POST /automation/tick` (privada, Bearer).
 
 ## Para quem for estender isto
 
