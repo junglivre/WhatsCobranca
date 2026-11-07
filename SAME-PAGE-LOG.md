@@ -22,4 +22,5 @@
 
 ## Verificação
 
-- `npx tsc --noEmit` OK; `npm run verify` rodando (58 cenários esperados). Smoke real só quando houver conta Efí — produção segue no Asaas.
+- `npm run verify`: **58 cenários** PASS + VERIFY PASS (commit ecb2de1). Três defeitos encontrados e corrigidos no caminho: transport http/https por protocolo, fake que só aceitava o 1º token OAuth (cada execução de cobrança cria nova instância do adapter) e `efiFake` sem `close()` no `finally` (segurava o event loop e travava o `compose run` do verify).
+- Deploy em produção: health ok, caminho Asaas intacto (`cobranças` respondeu). Adapter Efí inativo até `BILLING_PROVIDER=efi` + credenciais — smoke real exige conta Efí de homologação (client_id/secret, chave Pix, webhook `?token=`).
