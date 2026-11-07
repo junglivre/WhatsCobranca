@@ -131,13 +131,13 @@ Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`)
 
 Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`) e ledger de movimentações (`stock_movements`: IN/OUT/ADJUST/RETURN). Quantidades em `numeric(12,3)` — aritmética sempre no SQL, nunca Float em JS.
 
-**Comandos:** `material novo` (guiado: nome → unidade → saldo inicial → mínimo), `entrada 10 cabo`, `ajustar cabo para 20` (mostra atual → novo, pede confirmação), `devolver 2 cabo OS 5`, `saldo cabo`, `estoque`.
+**Comandos:** `material novo` (guiado: nome → unidade → saldo inicial → **custo médio inicial, só perguntado se o saldo for > 0** → mínimo), `entrada 10 cabo [custo 5,00]`, `ajustar cabo para 20` (mostra atual → novo, pede confirmação), `devolver 2 cabo OS 5`, `saldo cabo`, `estoque`.
 
 **Materiais na OS:** após o valor, o bot pergunta "Usou materiais? Liste 'quantidade nome' separado por vírgula ou responda não. (Ex.: 2 cabo, 3 disjuntor)". Na lista, **decimais usam ponto** (`2.5 cabo`) — a vírgula separa itens (`2,5 cabo` sozinho também funciona como decimal). Materiais resolvidos no catálogo são baixados transacionalmente na confirmação; material inexistente entra como **pendente de cadastro** (sem baixa, citado no recibo).
 
 **Regras:** sem saldo negativo (confirmação bloqueada com mensagem determinística — dê entrada e confirme de novo); baixa idempotente (re-confirmação nunca duplica movement); itens imutáveis após confirmar; `corrigir materiais` reabre a lista apagando os itens do rascunho. Nota de voz também preenche materiais quando o LLM extrai a lista (material ambíguo/inexistente fica pendente, nunca criado automaticamente).
 
-**Limitação:** custo médio do material não é calculado nesta fase (sem campo nem fluxo).
+**Custo médio:** `average_cost_cents` em `inventory_items`, atualizado por média ponderada a cada `entrada ... custo <valor>` (`(saldo×custo_atual + qtd×custo_novo)/(saldo+qtd)`, arredondado ao centavo). Entrada sem `custo` nunca altera a média existente; sem custo informado em nenhuma entrada, o campo fica `NULL` (nunca inventa zero). Aparece em `saldo`/`estoque` quando conhecido.
 
 ## Financeiro e integrações plugáveis (Fase 6)
 
@@ -199,8 +199,6 @@ Depois de criar uma cobrança (Pix copia-e-cola ou boleto com link de PDF já di
 **Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
 
 **Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
-
-**Limitações desta fase:** custo médio de material segue fora.
 
 ## Emissão fiscal (Fase 7)
 

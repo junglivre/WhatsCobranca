@@ -140,6 +140,7 @@ model InventoryItem {
   unit          String
   quantity      Decimal  @default(0) @db.Decimal(12, 3)
   minQuantity   Decimal? @map("min_quantity") @db.Decimal(12, 3)
+  averageCostCents Int? @map("average_cost_cents")
   active        Boolean  @default(true)
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   orderItems    ServiceOrderItem[]

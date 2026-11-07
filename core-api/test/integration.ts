@@ -237,6 +237,12 @@ async function itemQuantity(itemId: string): Promise<string> {
   );
   return rows[0]!.quantity;
 }
+async function itemAverageCost(itemId: string): Promise<number | null> {
+  const rows = await prisma.$queryRawUnsafe<Array<{ average_cost_cents: number | null }>>(
+    'SELECT average_cost_cents FROM inventory_items WHERE id=$1::uuid', itemId,
+  );
+  return rows[0]!.average_cost_cents;
+}
 async function seedOrder(description: string, customerName: string): Promise<{ id: string; number: number }> {
   const customerId = await seedCustomer(customerName);
   const rows = await prisma.$queryRawUnsafe<Array<{ id: string; number: number }>>(
@@ -1539,7 +1545,11 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(stillSaldo.payload?.matName, 'Cabo Flexível 2,5mm');
     assert.equal(stillSaldo.payload?.matUnit, 'm');
     assert.deepEqual(await stockCounts(), { items: 0, orderItems: 0, movements: 0 });
-    assert.match((await inbound('10')).text, /mínimo/i);
+    assert.match((await inbound('10')).text, /custo/i);
+    const custoState = await pending('matCusto');
+    assert.equal(custoState.payload?.matSaldo, '10');
+    // '-' pula o custo opcional (fica NULL) — material sem custo conhecido.
+    assert.match((await inbound('-')).text, /mínimo/i);
     const saldoState = await pending('matMinimo');
     assert.equal(saldoState.payload?.matSaldo, '10');
     // '-' pula o mínimo opcional (fica NULL).
@@ -1647,6 +1657,58 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(last.inventory_item_id, solda.id);
     assert.equal(last.source_message_id, posted.id);
     assert.equal(await itemQuantity(cabo.id), '30.000');
+  }],
+  ['custo médio ponderado: material novo com custo, entrada acumula média, saldo zero pula a pergunta', async () => {
+    // Guiado: saldo inicial > 0 pergunta custo; R$ 5,00/m em 20m.
+    await inbound('material novo');
+    await inbound('Fio Costeado');
+    await inbound('m');
+    assert.match((await inbound('20')).text, /custo/i);
+    await pending('matCusto');
+    assert.match((await inbound('5,00')).text, /mínimo/i);
+    const confirmReply = await inbound('-');
+    assert.match(confirmReply.text, /Custo médio: R\$ 5,00\/m/);
+    const created = await inbound('sim');
+    await pending(null);
+    assert.match(created.text, /Fio Costeado cadastrado \(20 m, custo médio R\$ 5,00\/m\)\./);
+    const item = (await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      "SELECT id FROM inventory_items WHERE name='Fio Costeado'",
+    ))[0]!;
+    assert.equal(await itemAverageCost(item.id), 500);
+    assert.match((await inbound('saldo Fio Costeado')).text, /Fio Costeado: 20 m · custo médio R\$ 5,00\/m/);
+    assert.match((await inbound('estoque')).text, /Fio Costeado — 20 m · custo médio R\$ 5,00\/m/);
+    // Entrada com custo diferente pondera pela quantidade: (20×500+10×800)/30=600.
+    const askCost = await inbound('entrada 10 Fio Costeado custo 8,00');
+    assert.match(askCost.text, /Entrada de 10 m de Fio Costeado a R\$ 8,00\/m\? Responda sim ou cancelar\./);
+    const withCost = await inbound('sim');
+    await pending(null);
+    assert.match(withCost.text, /Entrada registrada: Fio Costeado \+10 m\. Saldo: 30 m\. Custo médio: R\$ 6,00\/m\./);
+    assert.equal(await itemAverageCost(item.id), 600);
+    // Entrada sem custo não altera a média já conhecida.
+    const noCost = await inbound('entrada 5 Fio Costeado');
+    await inbound('sim');
+    await pending(null);
+    assert.equal(await itemAverageCost(item.id), 600);
+    void noCost;
+    // Custo inválido é rejeitado de forma determinística, sem criar pendência.
+    const invalidCost = await inbound('entrada 1 Fio Costeado custo abc');
+    assert.match(invalidCost.text, /Custo inválido\. Use, por exemplo, custo 5,00\./);
+    await pending(null);
+    assert.equal((await movements()).length, 3, 'custo inválido não deve gerar movimento');
+    // Saldo inicial 0: a pergunta de custo é pulada (nada para custear ainda).
+    await inbound('material novo');
+    await inbound('Conector Novo');
+    await inbound('un');
+    assert.match((await inbound('0')).text, /mínimo/i);
+    await pending('matMinimo');
+    const zeroSummary = await inbound('-');
+    assert.match(zeroSummary.text, /Custo médio: não informado/);
+    await inbound('sim');
+    await pending(null);
+    const zeroItem = (await prisma.$queryRawUnsafe<Array<{ id: string }>>(
+      "SELECT id FROM inventory_items WHERE name='Conector Novo'",
+    ))[0]!;
+    assert.equal(await itemAverageCost(zeroItem.id), null);
   }],
   ['ajustar moves balance up and down with confirmation and exact delta ledger', async () => {
     const disjuntor = await seedItem('Disjuntor', 'un', '5', '1');

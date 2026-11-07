@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0 — Custo médio de material (fecha limitação da Fase 5)
+
+- `inventory_items.average_cost_cents`: custo médio ponderado, `NULL` até a primeira entrada com custo informado — nunca inventa zero.
+- `entrada <qtd> <material> [custo <valor>]`: com custo, pondera pela quantidade existente (`(saldo×custo_atual + qtd×novo)/(saldo+qtd)`, arredondado ao centavo, calculado em SQL); sem custo, a média existente não muda. `material novo` ganhou o passo opcional "Custo médio inicial?", só perguntado quando o saldo inicial é > 0.
+- `saldo`/`estoque` mostram o custo médio quando conhecido.
+- Corrigido bug pré-existente descoberto no caminho: `parseQuantity('0')` rejeitava literal `0` no "Saldo inicial?" (prompt oferecia "ou 0", mas sempre respondia "Quantidade inválida") — bloqueava justamente o caso que decide se a pergunta de custo aparece.
+- 1 cenário novo cobrindo a lacuna, mais a atualização dos dois cenários existentes de estoque afetados (62 no total).
+
 ## 0.7.1 — Correções pós-Efí e boleto com link real
 
 - `docker-compose.yml` não repassava as 10 variáveis novas (`EFI_*`, `REPORT_*`) ao container `core-api`. Novo guard `scripts/check-compose-env.mjs` (compara `config.ts` × compose) roda no início do `npm run verify` e falha cedo se faltar alguma.

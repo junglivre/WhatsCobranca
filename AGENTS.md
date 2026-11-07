@@ -42,6 +42,7 @@ Leia `README.md` antes de mexer em qualquer coisa. A arquitetura e a gramática 
 - Item de OS sem `inventory_item_id` é pendente de classificação: não baixa estoque, citado no recibo. Materiais extraídos por áudio seguem a mesma regra — nunca criam item de catálogo automaticamente.
 - Itens de OS são imutáveis após `CONFIRMADA`/`CANCELADA`; `corrigir materiais` apaga e reabre a lista APENAS em rascunho.
 - Órdem de exibição dos itens usa a coluna `position` (ordem de digitação), nunca `created_at` (idêntico na mesma transação).
+- `average_cost_cents` é média ponderada calculada em SQL numa única `UPDATE` (o `SET` enxerga os valores ANTIGOS de `quantity`/`average_cost_cents`, nunca a própria atualização — não precisa de CTE/`FOR UPDATE` como o `ADJUST`). `NULL` até a primeira entrada com custo; entrada sem custo nunca move a média existente.
 
 ## Invariantes de integrações (Fase 6)
 

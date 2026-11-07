@@ -10,7 +10,7 @@ import type { InvoiceRequestResult } from './providers/invoices/types.js';
 
 type Purpose = 'CREATE' | 'QUERY' | 'MATERIAL';
 type CustomerRow = { id: string; name: string };
-type MaterialRow = { id: string; name: string; unit: string; quantity: string; min_quantity: string | null };
+type MaterialRow = { id: string; name: string; unit: string; quantity: string; min_quantity: string | null; average_cost_cents: number | null };
 type OrderRow = {
   id: string;
   number: number;
@@ -51,7 +51,11 @@ type ConversationPayload = {
   matUnit?: string;
   matSaldo?: string;
   matMinimo?: string;
+  // Custo médio (centavos) — opcional em 'material novo' (só perguntado com
+  // saldo inicial > 0) e em 'entrada ... custo <valor>'.
+  matCustoCents?: number;
   entryQuantity?: string;
+  entryCostCents?: number;
   adjustQuantity?: string;
   returnQuantity?: string;
   returnOsNumber?: number;
@@ -184,7 +188,13 @@ function payloadOf(value: unknown): ConversationPayload {
     matUnit: typeof record.matUnit === 'string' ? record.matUnit : undefined,
     matSaldo: quantityString(record.matSaldo),
     matMinimo: typeof record.matMinimo === 'string' && record.matMinimo.length <= 12 ? record.matMinimo : undefined,
+    matCustoCents: typeof record.matCustoCents === 'number' && Number.isSafeInteger(record.matCustoCents) && record.matCustoCents > 0
+      ? record.matCustoCents
+      : undefined,
     entryQuantity: quantityString(record.entryQuantity),
+    entryCostCents: typeof record.entryCostCents === 'number' && Number.isSafeInteger(record.entryCostCents) && record.entryCostCents > 0
+      ? record.entryCostCents
+      : undefined,
     adjustQuantity: quantityString(record.adjustQuantity),
     returnQuantity: quantityString(record.returnQuantity),
     returnOsNumber: typeof record.returnOsNumber === 'number' && Number.isSafeInteger(record.returnOsNumber)
@@ -499,7 +509,7 @@ async function processQuery(
     await queueReply(tx, operatorId, sourceMessageId, replyTo, [
       'Atendimento: novo; OS <n>; mostra as OS do <nome>; o que fiz hoje?; corrigir valor|descrição|materiais; cancelar; cancelar OS <n>.',
       'Clientes: cliente <nome>; histórico <nome>; telefone <nome> <número>; email <nome> <endereço>; endereco <nome> | <rua>, <nº>, <bairro>, <cidade>/<UF>, <CEP>; cpf <nome> <documento>; autorizar <nome>; revogar <nome>.',
-      'Estoque: material novo; entrada <qtd> <material>; ajustar <material> para <qtd>; devolver <qtd> <material> OS <n>; saldo <material>; estoque.',
+      'Estoque: material novo; entrada <qtd> <material> [custo <valor>]; ajustar <material> para <qtd>; devolver <qtd> <material> OS <n>; saldo <material>; estoque.',
       'Cobrança: cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]; cobranças; vencidas; recebi OS <n> <valor> [pix|dinheiro]; cancelar cobrança OS <n>.',
       'Nota fiscal: emitir NF OS <n> <código>; notas; nota emitida OS <n> <número>; cancelar nota OS <n>.',
       'Relatórios: fechamento; relatorio semanal.',
@@ -781,7 +791,7 @@ async function confirmationReceipt(tx: Tx, orderId: string): Promise<string> {
 
 async function searchMaterials(tx: Tx, term: string): Promise<MaterialRow[]> {
   return tx.$queryRawUnsafe<MaterialRow[]>(
-    'SELECT id, name, unit, quantity::text AS quantity, min_quantity::text AS min_quantity FROM inventory_items WHERE active AND strpos(normalized_name, $1)>0 ORDER BY created_at, id',
+    'SELECT id, name, unit, quantity::text AS quantity, min_quantity::text AS min_quantity, average_cost_cents FROM inventory_items WHERE active AND strpos(normalized_name, $1)>0 ORDER BY created_at, id',
     normalize(term),
   );
 }
@@ -821,12 +831,34 @@ async function handleMaterialCreationStep(
     return;
   }
   if (field === 'matSaldo') {
-    const saldo = parseQuantity(body);
+    // parseQuantity rejeita '0' (quantidades de movimento nunca são zero),
+    // mas o saldo inicial do cadastro aceita explicitamente — prompt oferece.
+    const saldo = body.trim() === '0' ? '0' : parseQuantity(body);
     if (saldo === null) {
       await queueReply(tx, message.operator_id, message.id, replyTo, 'Quantidade inválida. Use, por exemplo, 2 ou 2,5.', 'mat-saldo-invalid');
       return;
     }
-    await saveState(tx, message.operator_id, 'matMinimo', { ...payload, matSaldo: saldo }, null, replyTo);
+    // Custo só faz sentido com saldo inicial > 0; sem estoque, pula direto.
+    if (saldo === '0') {
+      await saveState(tx, message.operator_id, 'matMinimo', { ...payload, matSaldo: saldo }, null, replyTo);
+      await queueReply(tx, message.operator_id, message.id, replyTo, 'Estoque mínimo? (número, ou - para pular)', 'mat-min');
+      return;
+    }
+    await saveState(tx, message.operator_id, 'matCusto', { ...payload, matSaldo: saldo }, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo, 'Custo médio inicial? (R$, ex.: 5,00, ou - para pular)', 'mat-custo');
+    return;
+  }
+  if (field === 'matCusto') {
+    let custoCents: number | undefined;
+    if (body.trim() !== '-') {
+      const parsed = parseMoney(body);
+      if (parsed === null || parsed <= 0) {
+        await queueReply(tx, message.operator_id, message.id, replyTo, 'Custo inválido. Use, por exemplo, 5,00, ou - para pular.', 'mat-custo-invalid');
+        return;
+      }
+      custoCents = parsed;
+    }
+    await saveState(tx, message.operator_id, 'matMinimo', { ...payload, matCustoCents: custoCents }, null, replyTo);
     await queueReply(tx, message.operator_id, message.id, replyTo, 'Estoque mínimo? (número, ou - para pular)', 'mat-min');
     return;
   }
@@ -836,7 +868,7 @@ async function handleMaterialCreationStep(
       await queueReply(tx, message.operator_id, message.id, replyTo, 'Quantidade inválida. Use, por exemplo, 2 ou 2,5, ou - para pular.', 'mat-min-invalid');
       return;
     }
-    const summary = `Nome: ${payload.matName}\nUnidade: ${payload.matUnit}\nSaldo inicial: ${formatQty(payload.matSaldo ?? '0')} ${payload.matUnit}\nMínimo: ${minimo === null ? '—' : `${formatQty(minimo)} ${payload.matUnit}`}\nConfirma? Responda sim ou cancelar.`;
+    const summary = `Nome: ${payload.matName}\nUnidade: ${payload.matUnit}\nSaldo inicial: ${formatQty(payload.matSaldo ?? '0')} ${payload.matUnit}\nCusto médio: ${payload.matCustoCents ? `${formatMoney(payload.matCustoCents)}/${payload.matUnit}` : 'não informado'}\nMínimo: ${minimo === null ? '—' : `${formatQty(minimo)} ${payload.matUnit}`}\nConfirma? Responda sim ou cancelar.`;
     await saveState(tx, message.operator_id, 'MATERIAL_CONFIRM', { ...payload, matMinimo: minimo ?? undefined }, null, replyTo);
     await queueReply(tx, message.operator_id, message.id, replyTo, summary, 'mat-confirm');
     return;
@@ -849,10 +881,10 @@ async function confirmMaterialCreation(tx: Tx, message: MessageRow, payload: Con
   if (!name || !unit) throw new Error('MATERIAL_FIELDS_MISSING');
   const saldo = payload.matSaldo ?? '0';
   const items = await tx.$queryRawUnsafe<{ id: string }[]>(
-    `INSERT INTO inventory_items(name, normalized_name, unit, quantity, min_quantity)
-     VALUES($1, $2, $3, $4::numeric, ${payload.matMinimo ? '$5::numeric' : 'NULL'})
+    `INSERT INTO inventory_items(name, normalized_name, unit, quantity, min_quantity, average_cost_cents)
+     VALUES($1, $2, $3, $4::numeric, $5::numeric, $6::int)
      RETURNING id`,
-    name, normalize(name), unit, saldo, ...(payload.matMinimo ? [payload.matMinimo] : []),
+    name, normalize(name), unit, saldo, payload.matMinimo ?? null, payload.matCustoCents ?? null,
   );
   const item = items[0];
   if (!item) throw new Error('MATERIAL_NOT_CREATED');
@@ -862,7 +894,7 @@ async function confirmMaterialCreation(tx: Tx, message: MessageRow, payload: Con
   }
   await saveState(tx, message.operator_id, null, null, null, replyTo);
   await queueReply(tx, message.operator_id, message.id, replyTo,
-    `Material ${name} cadastrado (${formatQty(saldo)} ${unit}${payload.matMinimo ? `, mínimo ${formatQty(payload.matMinimo)}` : ''}).`, 'mat-created');
+    `Material ${name} cadastrado (${formatQty(saldo)} ${unit}${payload.matMinimo ? `, mínimo ${formatQty(payload.matMinimo)}` : ''}${payload.matCustoCents ? `, custo médio ${formatMoney(payload.matCustoCents)}/${unit}` : ''}).`, 'mat-created');
 }
 
 // Fila de materiais da OS: resolve cada pendente (catalogado, pendente de
@@ -948,13 +980,22 @@ async function handleStockCommand(
 ): Promise<void> {
   const operatorId = message.operator_id;
   const sourceMessageId = message.id;
-  const entrada = body.match(/^entrada\s+(\S+)\s+(.+)$/i);
+  const entrada = body.match(/^entrada\s+(\S+)\s+(.+?)(?:\s+custo\s+(\S+))?$/i);
   if (entrada) {
     const quantity = parseQuantity(entrada[1]!);
     const term = clean(entrada[2]!);
     if (quantity === null) {
       await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Quantidade inválida. Use, por exemplo, 2 ou 2,5.', 'qty-invalid');
       return;
+    }
+    let costCents: number | undefined;
+    if (entrada[3] !== undefined) {
+      const parsedCost = parseMoney(entrada[3]);
+      if (parsedCost === null || parsedCost <= 0) {
+        await queueReply(tx, operatorId, sourceMessageId, replyTo, 'Custo inválido. Use, por exemplo, custo 5,00.', 'entry-cost-invalid');
+        return;
+      }
+      costCents = parsedCost;
     }
     const matches = await searchMaterials(tx, term);
     if (matches.length === 0) {
@@ -965,15 +1006,15 @@ async function handleStockCommand(
       const choices = matches.map((material, index) => `${index + 1}. ${material.name} (${formatQty(material.quantity)} ${material.unit})`).join('\n');
       await saveState(tx, operatorId, 'AWAITING_DISAMBIGUATION', {
         purpose: 'MATERIAL', candidates: matches.map((material) => ({ id: material.id, name: material.name })), ...(restore ? { restoreConfirm: restore } : {}),
-        name: term, entryQuantity: quantity,
+        name: term, entryQuantity: quantity, entryCostCents: costCents,
       }, null, replyTo);
       await queueReply(tx, operatorId, sourceMessageId, replyTo, `Encontrei mais de um material para "${term}":\n${choices}\nResponda com o número.`, 'mat-many');
       return;
     }
     const material = matches[0]!;
-    await saveState(tx, operatorId, 'MATERIAL_CONFIRM', { purpose: 'MATERIAL', entryQuantity: quantity, name: term, matName: material.name, matUnit: material.unit, ...(restore ? { restoreConfirm: restore } : {}) }, null, replyTo);
+    await saveState(tx, operatorId, 'MATERIAL_CONFIRM', { purpose: 'MATERIAL', entryQuantity: quantity, entryCostCents: costCents, name: term, matName: material.name, matUnit: material.unit, ...(restore ? { restoreConfirm: restore } : {}) }, null, replyTo);
     await queueReply(tx, operatorId, sourceMessageId, replyTo,
-      `Entrada de ${formatQty(quantity)} ${material.unit} de ${material.name}? Responda sim ou cancelar.`, 'entry-confirm');
+      `Entrada de ${formatQty(quantity)} ${material.unit} de ${material.name}${costCents ? ` a ${formatMoney(costCents)}/${material.unit}` : ''}? Responda sim ou cancelar.`, 'entry-confirm');
     return;
   }
   const ajustar = body.match(/^ajustar\s+(.+?)\s+para\s+(\S+)$/i);
@@ -1051,22 +1092,22 @@ async function handleStockCommand(
       return;
     }
     const lines = matches.map((material) =>
-      `${material.name}: ${formatQty(material.quantity)} ${material.unit}${material.min_quantity ? ` (mínimo ${formatQty(material.min_quantity)} ${material.unit})` : ''}`);
+      `${material.name}: ${formatQty(material.quantity)} ${material.unit}${material.min_quantity ? ` (mínimo ${formatQty(material.min_quantity)} ${material.unit})` : ''}${material.average_cost_cents ? ` · custo médio ${formatMoney(material.average_cost_cents)}/${material.unit}` : ''}`);
     await queueReply(tx, operatorId, sourceMessageId, replyTo, lines.join('\n'), 'saldo');
     return;
   }
   if (/^estoque$/i.test(body)) {
     const materials = await tx.$queryRawUnsafe<MaterialRow[]>(
-      'SELECT name, unit, quantity::text AS quantity FROM inventory_items WHERE active ORDER BY name LIMIT 20',
+      'SELECT id, name, unit, quantity::text AS quantity, min_quantity::text AS min_quantity, average_cost_cents FROM inventory_items WHERE active ORDER BY name LIMIT 20',
     );
     await queueReply(tx, operatorId, sourceMessageId, replyTo,
       materials.length > 0
-        ? `Estoque:\n${materials.map((material) => `${material.name} — ${formatQty(material.quantity)} ${material.unit}`).join('\n')}`
+        ? `Estoque:\n${materials.map((material) => `${material.name} — ${formatQty(material.quantity)} ${material.unit}${material.average_cost_cents ? ` · custo médio ${formatMoney(material.average_cost_cents)}/${material.unit}` : ''}`).join('\n')}`
         : 'Estoque vazio.', 'stock-list');
     return;
   }
   await queueReply(tx, operatorId, sourceMessageId, replyTo,
-    "Comandos de estoque: 'material novo', 'entrada 10 cabo', 'ajustar cabo para 20', 'devolver 2 cabo OS 5', 'saldo cabo', 'estoque'.", 'stock-help');
+    "Comandos de estoque: 'material novo', 'entrada 10 cabo [custo 5,00]', 'ajustar cabo para 20', 'devolver 2 cabo OS 5', 'saldo cabo', 'estoque'.", 'stock-help');
 }
 
 // ===== Confirm de material (entrada/ajuste/devolução) e steps guiados =====
@@ -1096,11 +1137,24 @@ async function confirmMaterialOperation(
       material = rows[0];
     }
     if (!itemId || !material) throw new Error('MATERIAL_NOT_FOUND');
-    await tx.$queryRawUnsafe('UPDATE inventory_items SET quantity=quantity+$2::numeric WHERE id=$1::uuid', itemId, payload.entryQuantity);
-    await insertMovement(tx, itemId, 'IN', payload.entryQuantity, operatorId, sourceMessageId, 'Entrada manual', null);
+    const updated = await tx.$queryRawUnsafe<Array<{ average_cost_cents: number | null }>>(
+      `UPDATE inventory_items
+          SET quantity=quantity+$2::numeric,
+              average_cost_cents = CASE
+                WHEN $3::int IS NULL THEN average_cost_cents
+                WHEN average_cost_cents IS NULL THEN $3::int
+                ELSE ROUND((quantity * average_cost_cents + $2::numeric * $3::int) / (quantity + $2::numeric))::int
+              END
+        WHERE id=$1::uuid
+        RETURNING average_cost_cents`,
+      itemId, payload.entryQuantity, payload.entryCostCents ?? null,
+    );
+    await insertMovement(tx, itemId, 'IN', payload.entryQuantity, operatorId, sourceMessageId,
+      payload.entryCostCents ? `Entrada manual a ${formatMoney(payload.entryCostCents)}/${material.unit}` : 'Entrada manual', null);
     const after = await tx.$queryRawUnsafe<MaterialRow[]>('SELECT quantity::text AS quantity FROM inventory_items WHERE id=$1::uuid', itemId);
+    const newAverage = updated[0]?.average_cost_cents ?? null;
     suffix = 'entry-done';
-    replyBody = `Entrada registrada: ${material.name} +${formatQty(payload.entryQuantity)} ${material.unit}. Saldo: ${formatQty(after[0]?.quantity ?? null)} ${material.unit}.`;
+    replyBody = `Entrada registrada: ${material.name} +${formatQty(payload.entryQuantity)} ${material.unit}. Saldo: ${formatQty(after[0]?.quantity ?? null)} ${material.unit}.${newAverage !== null ? ` Custo médio: ${formatMoney(newAverage)}/${material.unit}.` : ''}`;
   } else if (payload.adjustQuantity !== undefined) {
     if (!itemId) {
       const rows = await searchMaterials(tx, payload.matName ?? payload.name ?? '');
@@ -2660,7 +2714,7 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
     return;
   }
   if (message.pending_action === 'matNome' || message.pending_action === 'matUnidade'
-    || message.pending_action === 'matSaldo' || message.pending_action === 'matMinimo') {
+    || message.pending_action === 'matSaldo' || message.pending_action === 'matCusto' || message.pending_action === 'matMinimo') {
     await handleMaterialCreationStep(tx, message, payload, body, replyTo);
     return;
   }
