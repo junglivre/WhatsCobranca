@@ -8,7 +8,11 @@
 - `domain.ts`: `pixBlock` virou `paymentBlock` genérico — Pix usa o copia-e-cola (como antes); boleto usa `Boleto: <link>`. A oferta de "enviar ao cliente" (telefone + `autorizar`), que só existia para Pix, agora cobre qualquer método com bloco de pagamento disponível — generalização natural, mesmo código de outbox/dedup já existente.
 - Fallback honesto para o caso sem link (ex.: `BILLING_PROVIDER=manual` via `cobrar ... boleto`, que não tem boleto real): mensagem diz "link ainda não disponível; consulte o provedor" em vez de inventar.
 
-## Verificação
+## Achado real ao cobrir isso em teste
 
-- `npx tsc --noEmit` OK.
-- `npm run verify`: ver resultado anexo nesta sessão. Cenário de boleto atualizado para asserir o link real persistido; cenário novo cobre boleto + telefone + consentimento → oferta de envio → entrega com link real na outbox.
+O cenário novo ("boleto com telefone...") travou com timeout de 20s no `tick()`. Isolei rodando `tsx test/integration.ts` direto contra o Postgres do `verify` que ficou de pé (porta 55433 exposta), com um array de cenários reduzido a só o que falhava — revelou `AssertionError: 'PENDING' !== 'SENT'`, não timeout. Causa: o mock WAHA local (`core-api/test/integration.ts`) só aceitava `sendText` para o `chatId` do PRÓPRIO operador (`assert.ok([OPERATOR_LID, OPERATOR_PHONE].includes(message.chatId))`) — nenhum cenário no arquivo inteiro jamais exercitava o envio ao CLIENTE (telefone+autorizar), só validado manualmente contra WAHA real em sessões anteriores. `deliver()` processa a fila em ordem de `position`; ao tentar enviar o aviso ao cliente (posição anterior à resposta ao operador) o mock rejeitava com 500, e a política "uma falha por tick" (`break` em `app.ts`) deixava a resposta do operador pendurada em `PENDING` até o próximo tick — daí o timeout do teste (esperava 1 tick, levaria 2). Corrigi o mock para aceitar qualquer `\d{10,13}@c.us`, espelhando a validação real do domínio (`payloadOf`).
+
+## Verificação e smoke real
+
+- `npm run verify`: 61 cenários PASS + VERIFY PASS (commit cb14d50).
+- Produção: `cobrar OS 4 boleto +5d` → confirmação → `Cobrança criada... Boleto: https://sandbox.asaas.com/b/pdf/nn5xbkhbvz36fxzt` → oferta de envio → `sim` → cliente recebeu a mensagem com o link real; operador recebeu "Cobrança enviada ao cliente." Health ok.
