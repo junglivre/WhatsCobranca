@@ -24,3 +24,15 @@
 
 - `npm run verify`: **58 cenários** PASS + VERIFY PASS (commit ecb2de1). Três defeitos encontrados e corrigidos no caminho: transport http/https por protocolo, fake que só aceitava o 1º token OAuth (cada execução de cobrança cria nova instância do adapter) e `efiFake` sem `close()` no `finally` (segurava o event loop e travava o `compose run` do verify).
 - Deploy em produção: health ok, caminho Asaas intacto (`cobranças` respondeu). Adapter Efí inativo até `BILLING_PROVIDER=efi` + credenciais — smoke real exige conta Efí de homologação (client_id/secret, chave Pix, webhook `?token=`).
+
+## Lacunas corrigidas pós-revisão (2026-11-07, commit 9167732)
+
+Ao revisar a entrega contra a documentação oficial da Efí, achei três defeitos reais (não cosméticos) e corrigi todos:
+
+1. **`docker-compose.yml` não repassava as 10 variáveis novas** (`EFI_*`, `REPORT_*`) ao container `core-api` — o `.env` tinha os valores, mas o Compose só injeta o que está listado em `environment:`. `BILLING_PROVIDER=efi` no `.env` teria subido com `EFI_CLIENT_ID=''` etc., falhando o fail-fast do registry em runtime. Criei `scripts/check-compose-env.mjs`: compara as chaves do schema `config.ts` com o `environment` do compose e falha cedo; plugado no início do `npm run verify`. Provei que o guarda pega o bug real rodando-o contra o compose do commit anterior (falhou, como esperado) e contra o corrigido (passou).
+2. **Webhook Efí perdia eventos**: a Efí agrupa vários Pix recebidos num único POST (`pix: [...]`), mas a porta só devolvia `NormalizedBillingEvent | null` (um evento). Mudei a porta para `NormalizedBillingEvent[]` (Asaas/manual devolvem 0 ou 1; Efí devolve todos). A rota persiste a lista inteira numa transação. Também passei a ignorar `devolucoes` (devolução de Pix, não recebimento) e entradas sem `txid` (Pix avulso/enviado) — só recebimento vira `RECEIVED`.
+3. **Não havia como cadastrar o webhook de verdade**: a Efí exige, por padrão, que o servidor valide o certificado de cliente dela já no ato do cadastro (mTLS) — um Cloudflare Tunnel comum não faz isso, e o cadastro falharia com "autenticação de TLS mútuo não configurada". Implementei `EfiBillingProvider.registerWebhook()` (usa o header oficial `x-skip-mtls-checking: true` + `?token=...&ignorar=` para a Efí não anexar `/pix` à rota) e o comando `node dist/efi-register-webhook.js <url>`.
+
+Também corrigidos, menores: `ajuda` só listava comandos até a Fase 5 (agora lista as 6 fases); `openapi.yaml` não documentava `POST /webhooks/billing/:provider`; `AGENTS.md`/README citavam escopo e contagem de rotas desatualizados.
+
+**Verificação:** `npm run verify` — 60 cenários PASS + VERIFY PASS (um defeito encontrado e corrigido no processo: a suíte HTTP fixava o texto antigo de `ajuda`). Deploy em produção: health ok, `ajuda` mostra as 6 fases, caminho Asaas (`cobranças`) segue respondendo sem regressão.
