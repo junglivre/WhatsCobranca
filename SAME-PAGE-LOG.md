@@ -25,4 +25,10 @@
 
 ## Verificação
 
+## Verificação (2026-11-07)
+
+- `npm run verify`: 55 cenários PASS + VERIFY PASS (commit 40dc61f; correção no próprio cenário agendado — limpar notificações da outbox entre partes).
+- Smoke real (WhatsApp, produção): `fechamento 07/11/2026` com alerta fiscal `OS-4-NF1`; `relatorio semanal 02/11–07/11` (3 OS · R$ 442,34; cobrado R$ 800; recebido R$ 200); `nota emitida OS 4 1024` → `AUTHORIZED | nfs=1024` + auditoria `INVOICE_AUTHORIZED`; `notas` → vazio.
+- Produção ficou com `REPORTS_ENABLED=true` (default): o fechamento diário passa a chegar sozinho a partir das 18h (SP); segundas, também o semanal.
+
 - `npx tsc --noEmit` OK; `npm run verify` e smoke real pendentes no deploy desta fase.
