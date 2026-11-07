@@ -2,6 +2,20 @@
 
 ---
 
+# Continuar OS (2026-11-07)
+
+Fecha a última limitação documentada do README: "não há comando para retomar um rascunho abandonado".
+
+`continuar OS <n>` reconstrói o próximo passo só a partir de `service_orders.status`/`amount_cents` — nunca do `conversation_states` que expirou (contrato: a OS sobrevive, a pendência não). `AGUARDANDO_DADOS` reabre `VALUE`; `AGUARDANDO_CONFIRMACAO` mostra o resumo pronto para `sim`. `CONFIRMADA`/`CANCELADA`/inexistente respondem determinístico.
+
+**Verificação:** `npm run verify` 63/63 + VERIFY PASS (commit a8b5462).
+
+**Incidente operacional durante o smoke (não é bug de produto):** o `--force-recreate` do `core-api` trocou o IP interno do container; `webhook-proxy` (nginx) manteve a resolução DNS antiga em cache e passou a devolver 502 para todo `POST /webhooks/waha` — mensagens reais do WhatsApp real ficaram represadas sem erro visível no WAHA. Corrigido com `docker compose restart webhook-proxy`. Lição para o próximo deploy: reiniciar o proxy junto, ou trocar para `depends_on` com healthcheck de verdade. Também vazei variáveis `DATABASE_URL`/`POSTGRES_*`/`AUTOMATION_TOKEN` etc. de uma sessão de debug isolada (`DATABASE_URL` apontando para `whatscobranca_verify`) para o shell persistente, o que quebrou um primeiro `docker compose up` em produção (auth falhou contra `whatscobranca_verify` em vez de `whatscobranca`) — sem efeito em dados reais porque a migração nunca chegou a autenticar; corrigido com `unset` das variáveis antes do redeploy.
+
+**Smoke real:** OS 000006 criada → `VALUE` expirado manualmente (simulando os 30 min) → `continuar OS 6` → "Retomando a OS 000006. Qual é o valor do atendimento?" → `65` → materiais `não` → `sim` → "OS 000006 confirmada... Valor: R$ 65,00".
+
+---
+
 # Custo médio de material (2026-11-07)
 
 Fecha a limitação "custo médio do material não é calculado" (citada duas vezes no README). `entrada <qtd> <material> [custo <valor>]` + passo opcional no `material novo` (só com saldo>0); média ponderada em SQL puro numa única UPDATE.
