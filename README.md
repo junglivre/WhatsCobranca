@@ -153,7 +153,7 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 **Para plugar um provedor novo:** implemente a interface da porta (o adapter `manual` é a referência mínima), registre no `registry.ts` e no enum do `config.ts`, e adicione cenários de integração com um fake HTTP do provedor. Regras invioláveis: status do provedor NUNCA são persistidos crus (o adapter traduz para o vocabulário interno); a intenção (linha `DRAFT` + `external_reference`) é persistida ANTES da chamada; após timeout/5xx, reconciliar via `findByExternalReference` antes de reenviar — nunca presumir falha.
 
 **Comandos do operador:**
-- `cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]` — guiado quando incompleto; resumo → confirmação → cobrança criada; Pix devolve o **copia-e-cola** na resposta.
+- `cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]` — guiado quando incompleto; resumo → confirmação → cobrança criada. Pix devolve o **copia-e-cola**; boleto Asaas devolve o **link do PDF** (`bankSlipUrl`, já na criação — nada baixado nem armazenado localmente).
 - `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
 - `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
@@ -194,13 +194,13 @@ Cadastre o contato antes de liberar mensagens financeiras:
 - `histórico <nome>` mostra as cinco OS mais recentes e o estado da cobrança.
 - `cancelar OS <n>` sempre pede confirmação. Para uma OS confirmada, o sistema registra RETURN e recompõe o estoque na mesma transação. Uma cobrança PENDING ou OVERDUE bloqueia o cancelamento até você executar `cancelar cobrança OS <n>`.
 
-Depois de criar um Pix, o bot só pergunta se deve enviar a cobrança ao cliente quando há telefone cadastrado e `autorizar` foi executado. A mensagem entra na mesma outbox do sistema, com deduplicação por cobrança.
+Depois de criar uma cobrança (Pix copia-e-cola ou boleto com link de PDF já disponível), o bot só pergunta se deve enviar ao cliente quando há telefone cadastrado e `autorizar` foi executado. A mensagem entra na mesma outbox do sistema, com deduplicação por cobrança.
 
 **Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
 
 **Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
 
-**Limitações desta fase:** boleto cria a cobrança mas não baixa o PDF (link no painel do provedor); custo médio de material segue fora.
+**Limitações desta fase:** custo médio de material segue fora.
 
 ## Emissão fiscal (Fase 7)
 

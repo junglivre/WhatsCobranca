@@ -74,7 +74,11 @@ const provider = http.createServer((request, response) => {
       assert.equal(request.headers['x-api-key'], settings.WAHA_API_KEY);
       const message = JSON.parse(raw) as Omit<Delivery, 'providerId'>;
       assert.equal(message.session, settings.WAHA_SESSION);
-      assert.ok([settings.OPERATOR_LID, settings.OPERATOR_PHONE].includes(message.chatId));
+      // O operador recebe respostas/avisos; clientes com telefone+autorizar
+      // recebem a cobrança (Pix copia-e-cola/boleto) no próprio chat deles —
+      // mesmo formato validado em domain.ts (payloadOf: /^\d{10,13}@c\.us$/).
+      assert.ok([settings.OPERATOR_LID, settings.OPERATOR_PHONE].includes(message.chatId)
+        || /^\d{10,13}@c\.us$/.test(message.chatId));
       assert.equal(typeof message.text, 'string');
       providerAttempts.push({ mode: deliveryMode, message });
       if (deliveryMode === 'reject400' || deliveryMode === 'reject503') {
@@ -437,6 +441,7 @@ type AsaasCustomer = { id: string; name: string; externalReference: string; cpfC
 type AsaasPayment = {
   id: string; customer: string; billingType: string; value: number;
   dueDate: string; description: string; externalReference: string; status: string; deleted: boolean;
+  bankSlipUrl: string | null;
 };
 type AsaasCall = { method: string; path: string; body: unknown };
 const asaasCustomers: AsaasCustomer[] = [];
@@ -514,6 +519,7 @@ const asaasFake = http.createServer((request, response) => {
         id: `pay_test_${++asaasSeq}`, customer: input.customer, billingType: input.billingType,
         value: input.value, dueDate: input.dueDate, description: input.description,
         externalReference: input.externalReference, status: 'PENDING', deleted: false,
+        bankSlipUrl: input.billingType === 'BOLETO' ? `https://www.asaas.com/b/pdf/fake-${asaasSeq}` : null,
       };
       // Resposta perdida: a cobrança EXISTE no provedor, mas o cliente vê 500 —
       // a reconciliação por externalReference precisa adotá-la sem duplicar.
@@ -522,14 +528,14 @@ const asaasFake = http.createServer((request, response) => {
         asaasCreateThen500 = false;
         return asaasReply(response, 500, { errors: [{ description: 'planned test failure after persisting' }] });
       }
-      return asaasReply(response, 200, { object: 'payment', id: payment.id, status: payment.status });
+      return asaasReply(response, 200, { object: 'payment', id: payment.id, status: payment.status, bankSlipUrl: payment.bankSlipUrl });
     }
     if (request.method === 'GET' && path === '/payments') {
       const externalReference = url.searchParams.get('externalReference');
       return asaasReply(response, 200, {
         object: 'list',
         data: asaasPayments.filter((payment) => payment.externalReference === externalReference)
-          .map((payment) => ({ id: payment.id, status: payment.deleted ? 'DELETED' : payment.status, value: payment.value })),
+          .map((payment) => ({ id: payment.id, status: payment.deleted ? 'DELETED' : payment.status, value: payment.value, bankSlipUrl: payment.bankSlipUrl })),
       });
     }
     const pixMatch = /^\/payments\/([^/]+)\/pixQrCode$/.exec(path);
@@ -711,13 +717,13 @@ type ChargeRow = {
   id: string; service_order_id: string; customer_id: string; provider: string;
   provider_charge_id: string | null; method: string; value_cents: number;
   due_date: string | null; status: string; external_reference: string;
-  pix_copy_paste: string | null; pix_qr_url: string | null; paid_value_cents: number | null;
+  pix_copy_paste: string | null; pix_qr_url: string | null; boleto_url: string | null; paid_value_cents: number | null;
 };
 async function charges(): Promise<ChargeRow[]> {
   return prisma.$queryRawUnsafe<ChargeRow[]>(
     `SELECT id::text AS id, service_order_id::text AS service_order_id, customer_id::text AS customer_id,
             provider, provider_charge_id, method, value_cents, due_date::text AS due_date, status,
-            external_reference, pix_copy_paste, pix_qr_url, paid_value_cents
+            external_reference, pix_copy_paste, pix_qr_url, boleto_url, paid_value_cents
        FROM charges ORDER BY created_at, id`,
   );
 }
@@ -2311,15 +2317,32 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     const done = await inbound('sim');
     await pending(null);
     assert.match(done.text, /Cobrança criada: OS 000001 · Boleto · R\$ 200,00 · vencimento 20\/11\/2026\./);
-    assert.match(done.text, /link disponível no painel Asaas\./);
+    assert.match(done.text, /Boleto: https:\/\/www\.asaas\.com\/b\/pdf\/fake-\d+/);
     assert.doesNotMatch(done.text, /copia-e-cola/);
     const charge = (await charges())[0]!;
     assert.equal(charge.method, 'BOLETO');
     assert.equal(charge.status, 'PENDING');
     assert.equal(charge.pix_copy_paste, null);
     assert.equal(charge.pix_qr_url, null);
+    assert.match(charge.boleto_url!, /^https:\/\/www\.asaas\.com\/b\/pdf\/fake-\d+$/);
     assert.equal(asaasPayments[0]!.billingType, 'BOLETO');
     assert.equal(asaasCallsTo('GET', `/payments/${charge.provider_charge_id}/pixQrCode`).length, 0, 'boleto não busca pix');
+  }],
+  ['boleto com telefone e consentimento oferece envio; link real chega ao cliente', async () => {
+    await restartAppWith(asaasEnv());
+    const order = await confirmOrder('Servico boleto cliente', 'Cliente Boleto Consentido', '90');
+    await inbound('telefone Cliente Boleto Consentido 5511988887777');
+    await inbound('autorizar Cliente Boleto Consentido');
+    await inbound(`cobrar OS ${order.number} boleto 20/11/2026`);
+    const offer = await inbound('sim');
+    await pending('CHARGE_SEND_CONFIRM');
+    assert.match(offer.text, /Enviar a cobrança de R\$ 90,00 ao cliente Cliente Boleto Consentido \(\+5511988887777\)\? Responda sim ou não\./);
+    const sent = await inbound('sim');
+    await pending(null);
+    assert.match(sent.text, /Cobrança enviada ao cliente\./);
+    const notice = (await notices()).find((entry) => entry.reply_to === '5511988887777@c.us');
+    assert.ok(notice);
+    assert.match(notice!.body, /^Olá Cliente Boleto Consentido! Cobrança referente à OS 000001 — Servico boleto cliente: R\$ 90,00, vencimento 20\/11\/2026\.\nBoleto: https:\/\/www\.asaas\.com\/b\/pdf\/fake-\d+$/);
   }],
   ['cobrar sem CPF/CNPJ recebe orientação determinística; após comando cpf a cobrança é criada', async () => {
     await restartAppWith(asaasEnv());

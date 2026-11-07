@@ -1685,7 +1685,7 @@ async function executeChargeCreation(
     'UPDATE charges SET provider_charge_id=$2, status=$3, updated_at=now() WHERE id=$1::uuid',
     chargeId, created.providerChargeId, created.status,
   );
-  let pixBlock = '';
+  let paymentBlock = '';
   if (method === 'PIX') {
     try {
       const pix = await provider.getPixData(created.providerChargeId);
@@ -1693,7 +1693,7 @@ async function executeChargeCreation(
         'UPDATE charges SET pix_copy_paste=$2, pix_qr_url=$3 WHERE id=$1::uuid',
         chargeId, pix.copyPaste, pix.qrImageUrl ?? null,
       );
-      pixBlock = `\nPix copia-e-cola:\n${pix.copyPaste}`;
+      paymentBlock = `\nPix copia-e-cola:\n${pix.copyPaste}`;
     } catch (error) {
       // QR indisponível no momento: a cobrança segue PENDING; dados pix podem
       // ser buscados depois pelo painel do provedor. Nunca silencioso: o
@@ -1703,19 +1703,22 @@ async function executeChargeCreation(
         error instanceof Error ? `${error.name}: ${error.message}` : error,
       );
     }
+  } else if (created.boletoUrl) {
+    // Asaas devolve o link do PDF já na criação (bankSlipUrl) — nada a baixar
+    // ou armazenar localmente, só repassar o link.
+    await tx.$executeRawUnsafe('UPDATE charges SET boleto_url=$2 WHERE id=$1::uuid', chargeId, created.boletoUrl);
+    paymentBlock = `\nBoleto: ${created.boletoUrl}`;
   }
   const base = `Cobrança criada: ${osLabel(order.number)} · ${method === 'PIX' ? 'Pix' : 'Boleto'} · ${formatMoney(order.amount_cents)} · vencimento ${formatDue(dueDate)}.`;
-  const extra = method === 'PIX'
-    ? pixBlock
-    : `\nBoleto ${created.providerChargeId}: link disponível no painel Asaas.`;
-  const contact = method === 'PIX' && pixBlock
+  const extra = paymentBlock || `\nBoleto ${created.providerChargeId}: link ainda não disponível; consulte o provedor.`;
+  const contact = paymentBlock
     ? (await tx.$queryRawUnsafe<Array<{ phone: string | null; billing_opt_in: boolean }>>(
       'SELECT phone, billing_opt_in FROM customers WHERE id=$1::uuid', order.customer_id,
     ))[0]
     : undefined;
   if (contact?.phone && contact.billing_opt_in) {
     const to = `${contact.phone}@c.us`;
-    const customerBody = `Olá ${order.customer}! Cobrança referente à ${osLabel(order.number)} — ${order.description}: ${formatMoney(order.amount_cents)}, vencimento ${formatDue(dueDate)}.\nPix copia-e-cola:\n${pixBlock.slice('\nPix copia-e-cola:\n'.length)}`;
+    const customerBody = `Olá ${order.customer}! Cobrança referente à ${osLabel(order.number)} — ${order.description}: ${formatMoney(order.amount_cents)}, vencimento ${formatDue(dueDate)}.${paymentBlock}`;
     await saveState(tx, operatorId, 'CHARGE_SEND_CONFIRM', {
       chargeSendTo: to, chargeSendBody: customerBody, chargeSendId: chargeId,
     }, null, replyTo);
@@ -1727,6 +1730,7 @@ async function executeChargeCreation(
   await saveState(tx, operatorId, null, null, null, replyTo);
   await queueReply(tx, operatorId, message.id, replyTo, `${base}${extra}`, 'charge-created');
 }
+
 
 // Execução do 'sim' em RECEIPT_CONFIRM: baixa de cobrança ativa OU registro
 // manual (CASH/EXTERNAL_PIX) — nunca rebaixa RECEIVED.

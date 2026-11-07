@@ -185,6 +185,7 @@ model Charge {
   externalReference String @unique @map("external_reference")
   pixCopyPaste String? @map("pix_copy_paste")
   pixQrUrl String? @map("pix_qr_url")
+  boletoUrl String? @map("boleto_url")
   paidValueCents Int? @map("paid_value_cents")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)

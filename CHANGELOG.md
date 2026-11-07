@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1 — Correções pós-Efí e boleto com link real
+
+- `docker-compose.yml` não repassava as 10 variáveis novas (`EFI_*`, `REPORT_*`) ao container `core-api`. Novo guard `scripts/check-compose-env.mjs` (compara `config.ts` × compose) roda no início do `npm run verify` e falha cedo se faltar alguma.
+- Porta `BillingProvider.validateAndNormalizeWebhook` devolve lista de eventos (Efí agrupa vários Pix por POST); a rota persiste todos numa transação. Devoluções e Pix sem `txid` são ignorados.
+- `EfiBillingProvider.registerWebhook()` + comando `efi-register-webhook.js`: cadastra o webhook real na Efí com `x-skip-mtls-checking` e `?token=...&ignorar=` (a Efí exige mTLS no cadastro por padrão, incompatível com túnel).
+- Boleto Asaas: o link do PDF (`bankSlipUrl`) agora é capturado na criação/reconciliação e devolvido na resposta — nada mais de "consulte o painel Asaas". A oferta de enviar a cobrança ao cliente (telefone + `autorizar`) passou a cobrir boleto, não só Pix.
+- `ajuda` lista todos os comandos das 6 fases; `openapi.yaml`/`AGENTS.md`/README atualizados. 3 cenários novos (61 no total).
+
 ## 0.7.0 — Integração Efí Pay (cobrança Pix plugável)
 
 - Terceiro adapter da porta `BillingProvider`: `BILLING_PROVIDER=efi` — cobrança Pix via API Pix padrão BCB (`PUT /v2/cob/{txid}`), txid determinístico derivado da `externalReference` (26–35 alfanuméricos). Registry fail-fast sem credenciais.

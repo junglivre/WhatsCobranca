@@ -115,7 +115,7 @@ export class AsaasBillingProvider implements BillingProvider {
 
   async createCharge(input: CreateChargeInput): Promise<CreatedCharge> {
     // CASH/EXTERNAL_PIX nunca chegam aqui — o domínio usa o provider manual.
-    const body = await this.request<{ id: string; status?: string }>('POST', '/payments', {
+    const body = await this.request<{ id: string; status?: string; bankSlipUrl?: string | null }>('POST', '/payments', {
       customer: input.providerCustomerId,
       billingType: input.method === 'PIX' ? 'PIX' : 'BOLETO',
       value: Number((input.valueCents / 100).toFixed(2)),
@@ -123,7 +123,7 @@ export class AsaasBillingProvider implements BillingProvider {
       description: input.description,
       externalReference: input.externalReference,
     });
-    return { providerChargeId: body.id, status: mapStatus(body.status) };
+    return { providerChargeId: body.id, status: mapStatus(body.status), boletoUrl: body.bankSlipUrl ?? null };
   }
 
   async getCharge(providerChargeId: string): Promise<ProviderChargeSnapshot> {
@@ -138,12 +138,12 @@ export class AsaasBillingProvider implements BillingProvider {
 
   /** OBRIGATÓRIO para reconciliar timeout: consultar ANTES de qualquer retry. */
   async findByExternalReference(ref: string): Promise<CreatedCharge | null> {
-    const found = await this.request<{ data?: Array<{ id?: string; status?: string }> }>(
+    const found = await this.request<{ data?: Array<{ id?: string; status?: string; bankSlipUrl?: string | null }> }>(
       'GET', `/payments?externalReference=${encodeURIComponent(ref)}`,
     );
     const payment = found.data?.[0];
     if (!payment?.id) return null;
-    return { providerChargeId: payment.id, status: mapStatus(payment.status) };
+    return { providerChargeId: payment.id, status: mapStatus(payment.status), boletoUrl: payment.bankSlipUrl ?? null };
   }
 
   async getPixData(providerChargeId: string): Promise<PixData> {

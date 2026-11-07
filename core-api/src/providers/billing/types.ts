@@ -45,6 +45,9 @@ export interface CreateChargeInput {
 export interface CreatedCharge {
   providerChargeId: string;
   status: ChargeStatus;
+  /** URL do PDF do boleto, quando o provedor devolve na própria criação
+   *  (ex.: Asaas `bankSlipUrl`). null/undefined quando não suportado. */
+  boletoUrl?: string | null;
 }
 
 export interface ProviderChargeSnapshot {
