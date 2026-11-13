@@ -15,7 +15,15 @@ WhatsApp → WAHA → webhook assinado (HMAC-SHA512) → inbox PostgreSQL
                                            outbox PostgreSQL → WAHA → WhatsApp
 ```
 
-Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico, estoque, cobrança por adapters e, desde a Fase 4, notas de voz transcritas e interpretadas por IA (ver [Áudio (Fase 4)](#áudio-fase-4)). A emissão fiscal tem porta e persistência, mas ainda não tem fluxo conversacional. A gramática de TEXTO continua 100% determinística; IA só entra no fluxo de áudio.
+Escopo desta POC: um operador autorizado, cadastro/busca de clientes, criação/correção/confirmação/cancelamento de Ordens de Serviço, consulta de histórico, estoque, cobrança por adapters e notas de voz transcritas e interpretadas por IA (ver [Áudio (Fase 4)](#áudio-fase-4)). O fluxo fiscal registra solicitações e permite baixa manual; nenhum adapter emite NFS-e automaticamente. A gramática de texto é determinística; IA só entra no fluxo de áudio.
+
+## Estado atual e pendências
+
+Revisão de 12/11/2026: ambiente em **homologação**, com Asaas sandbox e emissor fiscal `manual`. Efí tem adapter Pix e testes com fake, mas ainda precisa de correções e validação na homologação real. A integração direta com o Portal Nacional **não está implementada**.
+
+O histórico registra 63 cenários aprovados na última execução completa (07/11/2026). Na revisão de 12/11, foram consultados código, filas, saúde dos serviços e alertas de dependências; a suíte não foi reexecutada. Saúde verde não comprova correção financeira nem cobertura dos casos de falha.
+
+Consulte os achados, prioridades e critérios de correção no [registro da revisão](SAME-PAGE-LOG.md#revisão-geral-2026-11-12).
 
 ## Por que a conversa (de texto) não usa IA
 
@@ -41,7 +49,7 @@ Foi uma escolha deliberada: validar a cadeia WAHA → Core API → PostgreSQL co
 |---|---|
 | Core API (health) | `http://127.0.0.1:8080/health` |
 | n8n (editor) | `http://127.0.0.1:5678` |
-| Proxy de entrada (só `POST /webhooks/waha`) | `http://127.0.0.1:8081/webhooks/waha` |
+| Proxy de entrada (webhooks WAHA e financeiros, só POST) | `http://127.0.0.1:8081` |
 | PostgreSQL | `127.0.0.1:5433` |
 
 Tudo publica só em loopback. Serviços persistentes usam `restart: unless-stopped`. Os volumes pertencem ao projeto Compose — nunca rode `down -v` com dados que importam.
@@ -60,7 +68,7 @@ O `n8n-init` importa o workflow canônico (`n8n/workflows/poc1-tick.json`) e o a
 
 ## Expondo o webhook publicamente
 
-Esta POC não inclui reverse proxy público. Use o que já existir na sua infraestrutura (Cloudflare Tunnel, nginx com TLS, ngrok para teste) apontando **somente** para `http://127.0.0.1:8081` — essa porta já só aceita `POST /webhooks/waha` e devolve 404 para qualquer outro caminho/método.
+Esta POC não inclui reverse proxy público. Use a infraestrutura existente (Cloudflare Tunnel, nginx com TLS, ngrok para teste) apontando **somente** para `http://127.0.0.1:8081`. Essa porta aceita apenas `POST /webhooks/waha` e `POST /webhooks/billing/<provedor>`; outros caminhos/métodos devolvem 404.
 
 Depois de ter uma URL pública com HTTPS, configure a sessão no WAHA preservando o restante da config (`PUT /api/sessions/{session}`, mesclando `config.webhooks`, nunca substituindo o objeto inteiro):
 
@@ -78,7 +86,7 @@ Depois de ter uma URL pública com HTTPS, configure a sessão no WAHA preservand
 }
 ```
 
-A API valida `X-Webhook-Hmac` (HMAC-SHA512 hexadecimal sobre os bytes **originais** do corpo, comparação constant-time) e rejeita com 401 se faltar ou não bater. Limite de corpo: 131072 bytes (128 KiB) por padrão. Envelope autenticado mas malformado: 400, sem efeito colateral. Apenas os aliases literais em `OPERATOR_LID`/`OPERATOR_PHONE` são autorizados — sessões erradas, grupos, mensagens próprias e remetentes desconhecidos são ignorados sem criar estado.
+A API valida `X-Webhook-Hmac` (HMAC-SHA512 hexadecimal sobre os bytes **originais** do corpo, comparação constant-time) e rejeita com 401 se faltar ou não bater. Limite de corpo: 131072 bytes (128 KiB) por padrão. Envelope autenticado mas estruturalmente inválido fica em `webhook_events.state='INVALID'` e recebe 200, sem efeito no domínio. Apenas os aliases literais em `OPERATOR_LID`/`OPERATOR_PHONE` são autorizados; sessões erradas, grupos, mensagens próprias e remetentes desconhecidos são ignorados sem criar estado.
 
 ## Conversa
 
@@ -109,7 +117,7 @@ Notas de voz passam por **Groq Whisper** (STT) e **Groq LLM** antes de entrar no
 - JSON/schema inválido na extração → a transcrição vira a descrição do fluxo guiado normal, com resposta "Ouvi: <transcrição>" e pergunta do cliente; nada é criado antes da hora.
 - `intent != REGISTRAR_SERVICO` → resposta explicando o que o bot aceita (`AUDIO_INTENT_IGNORED`).
 - Falha de rede/5xx no STT ou LLM → inbox `PENDING` com as mesmas 5 tentativas limitadas → `FAILED` visível; o ledger de saída deduplica, não há risco de resposta duplicada.
-- Envelope autenticado mas estruturalmente inválido (incluindo nota de voz com `body=null`) → persistido como `webhook_events.state='INVALID'` e respondido **200** — nunca 400, que fazia o WAHA esgotar retry e perder mensagem real.
+- Envelope autenticado mas estruturalmente inválido → persistido como `webhook_events.state='INVALID'` e respondido **200**. JSON sintaticamente inválido com HMAC válido também recebe 200, mas não é persistido. `payload.body=null` é válido para mídia sem legenda; não torna o envelope inválido.
 
 **Configuração Groq** (zod em `core-api/src/config.ts`; exemplos em `.env.example`):
 
@@ -125,7 +133,7 @@ Timeouts de cliente: 30 s para download de mídia, STT e LLM (`AbortController`)
 
 **Privacidade:** nenhum byte de áudio é persistido nem vai para disco local — só o texto da transcrição fica no banco (coluna `messages.transcription`). O servidor Groq recebe os bytes por HTTPS e é tratado como processador externo; para instalações sem Groq, o áudio é simplesmente rejeitado sem sair da rede local.
 
-**Retomar rascunho abandonado:** uma pendência expira em 30 minutos sem resposta — a OS fica no banco em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO`, sem conversa ativa apontando para ela. `continuar OS <n>` retoma exatamente de onde parou: pede o valor se ainda faltar, ou mostra o resumo pronto para `sim`/`cancelar` se o valor já estiver definido (materiais ainda não respondidos podem ser adicionados depois com `corrigir materiais`). OS já `CONFIRMADA`/`CANCELADA` responde que não há rascunho para retomar.
+**Retomar rascunho abandonado:** uma pendência expira em 30 minutos sem resposta; a OS fica no banco em `AGUARDANDO_DADOS`/`AGUARDANDO_CONFIRMACAO`. `continuar OS <n>` reconstrói a etapa pelo estado persistido: pede o valor se faltar, ou mostra o resumo se o valor já estiver definido. Não recupera perguntas nem escolhas de materiais que existiam só na conversa expirada; revise o resumo e use `corrigir materiais` quando necessário. Se a conversa ainda contém a pendência vencida, a primeira mensagem apenas a encerra; repita o comando. OS `CONFIRMADA`/`CANCELADA` não permite retomada.
 
 ## Estoque (Fase 5)
 
@@ -146,9 +154,9 @@ Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`
 | Porta | Interface | Adapters atuais | Futuros sem refactor |
 |---|---|---|---|
 | Cobrança | `core-api/src/providers/billing/types.ts` (`BillingProvider`) | `asaas`, `efi`, `manual` | Gerencianet, Mercado Pago, PIX direto via PSP… |
-| NFS-e | `core-api/src/providers/invoices/types.ts` (`InvoiceProvider`) | `manual` (pendência p/ emissão humana) | `asaas` (Fase 7), **Portal Nacional direto** (sem terceiro) |
+| NFS-e | `core-api/src/providers/invoices/types.ts` (`InvoiceProvider`) | `manual` (pendência p/ emissão humana) | **Portal Nacional direto** (sem terceiro), Asaas NFS-e ou outro emissor |
 
-Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|manual`. Registry em `core-api/src/providers/registry.ts`.
+Seleção por env: `BILLING_PROVIDER=none|manual|asaas|efi`, `INVOICE_PROVIDER=none|manual`. Registry em `core-api/src/providers/registry.ts`. A seleção atual ativa um gateway de cobrança por vez; trocar a configuração não migra cobranças antigas nem mantém o webhook do gateway anterior disponível.
 
 **Para plugar um provedor novo:** implemente a interface da porta (o adapter `manual` é a referência mínima), registre no `registry.ts` e no enum do `config.ts`, e adicione cenários de integração com um fake HTTP do provedor. Regras invioláveis: status do provedor NUNCA são persistidos crus (o adapter traduz para o vocabulário interno); a intenção (linha `DRAFT` + `external_reference`) é persistida ANTES da chamada; após timeout/5xx, reconciliar via `findByExternalReference` antes de reenviar — nunca presumir falha.
 
@@ -162,9 +170,11 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas`, `INVOICE_PROVIDER=none|
 
 ### Adapter Efí Pay (`BILLING_PROVIDER=efi`)
 
-Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado deterministicamente da `externalReference` — `OS-12-C3` → 30 caracteres alfanuméricos). OAuth2 `client_credentials` com cache em memória; copia-e-cola vem do próprio corpo da cob; cancelamento é `PATCH` para `REMOVIDA_BY_USUARIO`; timeout/5xx reconcilia por `GET /v2/cob/{txid}` antes de qualquer reenvio. A cob expira às 23:59:59 do vencimento (piso 1h, teto 30 dias) — depois disso a Efí não aceita mais o pagamento. **Boleto não é suportado** — `cobrar OS n boleto` responde de forma determinística e a intenção fica `ERROR`.
+Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado da `externalReference`). OAuth2 `client_credentials`; copia-e-cola no corpo da cob; consulta por txid para reconciliação. A expiração usa o fim do dia do vencimento, limitada entre 1h e 30 dias; fora desse intervalo, o vencimento informado e a expiração efetiva divergem. **Boleto não é suportado.**
 
-**Env:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_BASE_URL` (default sandbox `https://api-sandbox.efipay.com.br`), `EFI_WEBHOOK_TOKEN` (segredo longo e aleatório, ex.: `openssl rand -hex 32`); a API Pix da Efí exige mTLS — `EFI_CERT_BASE64`/`EFI_KEY_BASE64` (certificado `.p12` da aplicação convertido para PEM, em base64). O registry falha no boot se a configuração mínima faltar, e o `docker-compose.yml` repassa todas ao container.
+**Bloqueios encontrados na revisão:** o default de URL do código/Compose não é a base oficial Pix; o registry aceita iniciar sem certificado; o PATCH de cancelamento e o mapper usam estados incorretos (`REMOVIDA_BY_*`). O contrato oficial usa `REMOVIDA_PELO_USUARIO_RECEBEDOR`/`REMOVIDA_PELO_PSP`. Corrigir esses pontos e o fake antes de considerar a integração homologada. Ver [credenciais](https://dev.efipay.com.br/docs/api-pix/credenciais) e [estados oficiais](https://dev.efipay.com.br/docs/api-pix/status).
+
+**Env para homologação:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_WEBHOOK_TOKEN` e **`EFI_BASE_URL=https://pix-h.api.efipay.com.br` explícito** (o default atual está errado). A Efí exige certificado emitido na própria conta para o ambiente de homologação, inclusive no OAuth: converta o `.p12` para PEM e configure `EFI_CERT_BASE64`/`EFI_KEY_BASE64`. Não é uma exigência exclusiva de produção. O registry ainda não valida a presença desse par.
 
 **Webhook — como a Efí funciona e como este projeto responde:**
 
@@ -196,7 +206,7 @@ Cadastre o contato antes de liberar mensagens financeiras:
 
 Depois de criar uma cobrança (Pix copia-e-cola ou boleto com link de PDF já disponível), o bot só pergunta se deve enviar ao cliente quando há telefone cadastrado e `autorizar` foi executado. A mensagem entra na mesma outbox do sistema, com deduplicação por cobrança.
 
-**Estados internos:** `DRAFT → PENDING → (OVERDUE) → CONFIRMED → RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED`, `ERROR`. Só `RECEIVED` conta como dinheiro recebido; `RECEIVED` nunca é rebaixado por evento posterior.
+**Estados internos:** o vocabulário inclui `DRAFT`, `PENDING`, `OVERDUE`, `CONFIRMED`, `RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED` e `ERROR`. O processamento ainda tem lacunas: pagamento parcial manual encerra a cobrança, `CONFIRMED` não bloqueia nova cobrança e estorno após `RECEIVED` não altera o saldo. Não use os relatórios como conciliação financeira até corrigir os achados da revisão.
 
 **Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
 
@@ -211,7 +221,7 @@ A porta `InvoiceProvider` (`core-api/src/providers/invoices/types.ts`) ganhou fl
 
 **Regras:** só OS `CONFIRMADA` com valor; exige CPF/CNPJ do tomador (orienta `cpf <nome> <documento>`); uma solicitação ativa por OS/provedor bloqueia nova emissão até `CANCELED`/`REJECTED`; falha de comunicação NUNCA presume perda — o adapter consulta `findByExternalReference` (âncora `OS-<n>-NF<seq>`) e, sem confirmação, a solicitação fica `NEEDS_REVIEW` com `last_error` para conferência manual no emissor.
 
-**Adapter `manual`:** nenhum emissor externo; toda solicitação vira `NEEDS_REVIEW` para emissão humana no Portal Nacional. É a referência para plugares Asaas NFS-e ou Portal Nacional direto: implemente a interface (agora com `findByExternalReference`), registre no `registry.ts` e no enum do `config.ts`.
+**Adapter `manual`:** nenhum emissor externo; toda solicitação vira `NEEDS_REVIEW` para emissão humana no Portal Nacional. Para integrar um emissor, implemente a interface (incluindo reconciliação por `findByExternalReference`), registre no `registry.ts` e no enum do `config.ts`. A porta fiscal é independente da porta de cobrança; usar Asaas para receber não obriga usar Asaas para emitir NF.
 
 ## Relatórios e automações (Fase 8)
 
@@ -225,6 +235,8 @@ Sob demanda ou agendados, sempre montados por SQL (centavos inteiros, datas em A
 **Alertas** (aparecem nos dois relatórios, só quando existe pendência): OS incompletas de dias anteriores, notas fiscais não concluídas (`NEEDS_REVIEW` etc., com referência) e materiais no mínimo (`saldo/mínimo unidade`).
 
 **Agendamento e política de envio** (env): `REPORTS_ENABLED` (`true`/`false`, default `true`), `REPORT_DAILY_HOUR` (0–23, default `18` — hora local a partir da qual o tick envia o fechamento do dia), `REPORT_WEEKLY_DAY` (0=domingo … 6=sábado, default `1`=segunda, enviado no mesmo horário). Idempotência por período em `report_deliveries` (`UNIQUE(kind, period_key)`) + `dedup_key` na outbox: tick duplicado ou Core reiniciado nunca gera segunda mensagem.
+
+**Limitações encontradas na revisão:** o marcador de envio e a outbox não são gravados na mesma transação; uma interrupção entre eles pode suprimir o relatório. Recebimentos usam `charges.updated_at`, não a data financeira do pagamento. O total semanal “Cobrado” inclui tentativas `ERROR` e cobranças canceladas. O semanal agendado na segunda considera segunda até o momento do envio, não a semana anterior.
 
 **Baixa da nota (complemento da Fase 7):** `nota emitida OS <n> <número da NFS-e>` fecha a solicitação ativa como `AUTHORIZED` guardando o número (auditada); `cancelar nota OS <n>` marca `CANCELED` (cancela no emissor quando há id externo). Autorizadas e canceladas saem da lista `notas`.
 
@@ -258,6 +270,8 @@ npm run restore -- backups/arquivo.dump nome_banco_novo  # restaura em banco NOV
 ```
 
 O restore recusa o banco operacional, qualquer banco de sistema e **qualquer destino já existente** — nunca sobrescreve. O dump cobre só o schema `public` (domínio da aplicação); o schema `n8n` volta pelo bootstrap do workflow canônico.
+
+**Pendências operacionais:** os scripts de backup/restore ainda executam `source` no arquivo de ambiente, embora o formato do Compose não seja equivalente ao do shell (inclusive para `$`). O repositório não inclui agendamento/retenção de backup; a revisão encontrou um único dump local, de 04/11/2026. Backups externos não foram verificados.
 
 ## Referência da API
 

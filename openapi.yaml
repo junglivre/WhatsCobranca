@@ -29,6 +29,9 @@ paths:
         fromMe, groups, unauthorized identity) return 200 without changing business
         state. Duplicate (session,payload.id) deliveries return 200 without repeated
         effects. A successful response acknowledges database commit, not WhatsApp delivery.
+        Authenticated structurally invalid envelopes return 200 with invalid=true
+        and are stored as INVALID. Authenticated malformed JSON also returns 200
+        with invalid=true, but is not stored.
       parameters:
         - in: header
           name: X-Webhook-Hmac
@@ -51,8 +54,9 @@ paths:
                 properties:
                   accepted: {type: boolean, enum: [true]}
                   ignored: {type: boolean}
+                  invalid: {type: boolean}
         '400':
-          description: Authenticated JSON/envelope is invalid; no processing
+          description: Request body was not available as raw bytes
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -149,7 +153,7 @@ components:
       type: object
       required: [id, session, event, payload]
       properties:
-        id: {type: string, description: Envelope id; not the deduplication key}
+        id: {type: string, minLength: 1, description: Envelope id; not the deduplication key}
         timestamp: {type: number}
         session: {type: string, example: default}
         event: {type: string, enum: [message]}
@@ -162,5 +166,11 @@ components:
             timestamp: {type: number}
             from: {type: string, minLength: 1}
             fromMe: {type: boolean}
-            body: {type: string}
+            body: {type: string, nullable: true}
             hasMedia: {type: boolean}
+            media:
+              type: object
+              nullable: true
+              properties:
+                url: {type: string, minLength: 1}
+                mimetype: {type: string}

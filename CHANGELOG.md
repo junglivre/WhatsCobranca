@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.9.0 — Retomar rascunho abandonado (fecha última limitação documentada da POC)
+## Não lançado — revisão geral de 12/11/2026
+
+- Diagnóstico priorizado em `SAME-PAGE-LOG.md`: durabilidade de cobranças, pagamentos parciais/confirmados, troca de gateway, estoque, Efí, segurança, relatórios e operação.
+- README corrigido para distinguir homologação, emissão fiscal manual e integrações futuras; inclui bloqueios Efí e limitações financeiras ainda abertas.
+- OpenAPI alinhado ao tratamento de envelopes autenticados inválidos (200), `body` nullable e `media` opcional.
+- Apenas documentação nesta revisão; nenhum bug de execução foi corrigido, nenhuma dependência atualizada e nenhum deploy realizado.
+
+## 0.9.0 — Retomar rascunho abandonado
 
 - `continuar OS <n>`: para OS em `AGUARDANDO_DADOS` (sem valor), reabre a pergunta de valor; para `AGUARDANDO_CONFIRMACAO` (valor já definido), mostra o resumo pronto para `sim`/`cancelar`. Tudo lido do banco — nenhum dado do rascunho original (descrição, cliente, materiais já respondidos) depende do `conversation_states` que expirou. OS `CONFIRMADA`/`CANCELADA` responde que não há rascunho para retomar; OS inexistente responde determinístico.
 - 1 cenário novo cobrindo os dois casos de retomada e as duas rejeições (63 no total).
