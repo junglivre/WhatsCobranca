@@ -156,14 +156,14 @@ Materiais com catálogo (`inventory_items`), itens por OS (`service_order_items`
 | Cobrança | `core-api/src/providers/billing/types.ts` (`BillingProvider`) | `asaas`, `efi`, `manual` | Gerencianet, Mercado Pago, PIX direto via PSP… |
 | NFS-e | `core-api/src/providers/invoices/types.ts` (`InvoiceProvider`) | `manual` (pendência p/ emissão humana) | **Portal Nacional direto** (sem terceiro), Asaas NFS-e ou outro emissor |
 
-Seleção por env: `BILLING_PROVIDER=none|manual|asaas|efi`, `INVOICE_PROVIDER=none|manual`. Registry em `core-api/src/providers/registry.ts`. A seleção atual ativa um gateway de cobrança por vez; trocar a configuração não migra cobranças antigas nem mantém o webhook do gateway anterior disponível.
+Seleção por env: `BILLING_PROVIDER=none|manual|asaas|efi` define somente o provider de **novas** cobranças. `BILLING_ENABLED_PROVIDERS=asaas,efi` define os adapters autorizados para webhooks e operações de cobranças históricas; se vazio, mantém a compatibilidade e habilita apenas o padrão. `INVOICE_PROVIDER=none|manual`. Trocar o padrão não migra dados nem desliga um provider histórico explicitamente habilitado.
 
 **Para plugar um provedor novo:** implemente a interface da porta (o adapter `manual` é a referência mínima), registre no `registry.ts` e no enum do `config.ts`, e adicione cenários de integração com um fake HTTP do provedor. Regras invioláveis: status do provedor NUNCA são persistidos crus (o adapter traduz para o vocabulário interno); a intenção (linha `DRAFT` + `external_reference`) é persistida ANTES da chamada; após timeout/5xx, reconciliar via `findByExternalReference` antes de reenviar — nunca presumir falha.
 
 **Comandos do operador:**
 - `cobrar OS <n> [pix|boleto] [DD/MM/AAAA|+Nd]` — guiado quando incompleto; resumo → confirmação → cobrança criada. Pix devolve o **copia-e-cola**; boleto Asaas devolve o **link do PDF** (`bankSlipUrl`, já na criação — nada baixado nem armazenado localmente).
 - `cobranças` — abertas (PENDING/OVERDUE). `vencidas` — só vencidas + total.
-- `recebi OS <n> <valor> [pix|dinheiro]` — registra pagamento externo (baixa a cobrança ativa ou cria registro manual já RECEIVED).
+- `recebi OS <n> <valor> [pix|dinheiro]` — quando há gateway aberto, pergunta se o dinheiro foi pago **por fora** ou se é confirmação do **gateway**. Pagamento externo vira parcela imutável e reduz o saldo sem cancelar o gateway; confirmação do gateway só é aceita com evento/pagamento verificável já persistido. Sem prova, fica em revisão e não quita nada.
 - `cancelar cobrança OS <n>` — cancela no provedor + marca CANCELED.
 
 - `cpf <nome> <documento>` — grava o CPF/CNPJ do cliente (11 ou 14 dígitos, pontuação opcional). O Asaas exige CPF/CNPJ do cliente para criar cobrança: se faltar, o bot orienta a informar com este comando e a intenção fica `ERROR` para tentar de novo.
@@ -172,9 +172,9 @@ Seleção por env: `BILLING_PROVIDER=none|manual|asaas|efi`, `INVOICE_PROVIDER=n
 
 Cobrança **Pix** via API Pix padrão BCB (`PUT /v2/cob/{txid}`, txid derivado da `externalReference`). OAuth2 `client_credentials`; copia-e-cola no corpo da cob; consulta por txid para reconciliação. A expiração usa o fim do dia do vencimento, limitada entre 1h e 30 dias; fora desse intervalo, o vencimento informado e a expiração efetiva divergem. **Boleto não é suportado.**
 
-**Bloqueios encontrados na revisão:** o default de URL do código/Compose não é a base oficial Pix; o registry aceita iniciar sem certificado; o PATCH de cancelamento e o mapper usam estados incorretos (`REMOVIDA_BY_*`). O contrato oficial usa `REMOVIDA_PELO_USUARIO_RECEBEDOR`/`REMOVIDA_PELO_PSP`. Corrigir esses pontos e o fake antes de considerar a integração homologada. Ver [credenciais](https://dev.efipay.com.br/docs/api-pix/credenciais) e [estados oficiais](https://dev.efipay.com.br/docs/api-pix/status).
+**Contrato corrigido:** o default de homologação é `https://pix-h.api.efipay.com.br`; Efí habilitada exige certificado/chave PEM em base64 já no boot; cancelamento usa `REMOVIDA_PELO_USUARIO_RECEBEDOR` e o mapper reconhece `REMOVIDA_PELO_PSP`. A prova isolada não equivale a homologação real. Ver [credenciais](https://dev.efipay.com.br/docs/api-pix/credenciais) e [estados oficiais](https://dev.efipay.com.br/docs/api-pix/status).
 
-**Env para homologação:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_WEBHOOK_TOKEN` e **`EFI_BASE_URL=https://pix-h.api.efipay.com.br` explícito** (o default atual está errado). A Efí exige certificado emitido na própria conta para o ambiente de homologação, inclusive no OAuth: converta o `.p12` para PEM e configure `EFI_CERT_BASE64`/`EFI_KEY_BASE64`. Não é uma exigência exclusiva de produção. O registry ainda não valida a presença desse par.
+**Env para homologação:** `EFI_CLIENT_ID`, `EFI_CLIENT_SECRET`, `EFI_PIX_KEY`, `EFI_WEBHOOK_TOKEN`, `EFI_CERT_BASE64` e `EFI_KEY_BASE64`. A base padrão já é `https://pix-h.api.efipay.com.br`. A Efí exige certificado emitido na própria conta para homologação e OAuth; o registry recusa ativação sem o par PEM válido.
 
 **Webhook — como a Efí funciona e como este projeto responde:**
 
@@ -188,7 +188,7 @@ docker compose run --rm --no-deps core-api node dist/efi-register-webhook.js htt
 
 O comando usa as mesmas variáveis `EFI_*`, monta a URL acima, chama `PUT /v2/webhook/{chave}` e imprime a URL com o token mascarado. O proxy já encaminha `POST /webhooks/billing/<provedor>`; o 200 de teste que a Efí dispara no cadastro é respondido como `ignored`.
 
-**Eventos:** o payload `{pix:[{endToEndId, txid, valor}, …]}` pode trazer vários Pix por chamada — todos são persistidos numa transação e deduplicados por `endToEndId`. Só recebimento vira `RECEIVED`: devolução (`devolucoes`), Pix sem `txid` e notificações `info` (ex.: recebimento recusado) são respondidos com 200 e ignorados.
+**Eventos:** o payload `{pix:[{endToEndId, txid, valor}, …]}` pode trazer vários Pix por chamada — todos são persistidos e deduplicados por identidade econômica. Cada recebimento e cada devolução confirmada vira movimento imutável de ledger, com valor/data/identificador; estorno parcial, integral e replay não apagam nem duplicam a entrada original. Pix sem `txid`, `info` e dados financeiros incompletos ficam ignorados ou em revisão, nunca quitam por fallback.
 
 **Limites desta integração:** o adapter é coberto por um fake HTTP que espelha os endpoints (OAuth, cob, webhook com a regra do skip-mTLS) — a validação contra a Efí **real** depende das credenciais da conta de homologação, e o mTLS de saída (`EFI_CERT_BASE64`/`EFI_KEY_BASE64`) só é exercitado nessa conta.
 
@@ -206,7 +206,7 @@ Cadastre o contato antes de liberar mensagens financeiras:
 
 Depois de criar uma cobrança (Pix copia-e-cola ou boleto com link de PDF já disponível), o bot só pergunta se deve enviar ao cliente quando há telefone cadastrado e `autorizar` foi executado. A mensagem entra na mesma outbox do sistema, com deduplicação por cobrança.
 
-**Estados internos:** o vocabulário inclui `DRAFT`, `PENDING`, `OVERDUE`, `CONFIRMED`, `RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED` e `ERROR`. O processamento ainda tem lacunas: pagamento parcial manual encerra a cobrança, `CONFIRMED` não bloqueia nova cobrança e estorno após `RECEIVED` não altera o saldo. Não use os relatórios como conciliação financeira até corrigir os achados da revisão.
+**Estados internos:** o vocabulário inclui `DRAFT`, `PENDING`, `OVERDUE`, `CONFIRMED`, `RECEIVED`, `PARTIALLY_PAID`, `CANCELED`, `REFUNDED` e `ERROR`. Saldo e relatórios usam o ledger financeiro (recebimentos menos estornos), não `updated_at` nem o último status do gateway. Registros legados sem data financeira continuam visíveis como “legado a conciliar” e não entram em totais por período.
 
 **Webhook financeiro:** `POST /webhooks/billing/:provider` — autenticação por token (`asaas-access-token`), resposta 200 rápida, dedup por `(provider, provider_event_id)`, processamento assíncrono no `/automation/tick`. O mesmo tick faz o sweep diário de vencidas (PENDING com vencimento passado → OVERDUE + aviso único ao operador).
 
@@ -236,7 +236,7 @@ Sob demanda ou agendados, sempre montados por SQL (centavos inteiros, datas em A
 
 **Agendamento e política de envio** (env): `REPORTS_ENABLED` (`true`/`false`, default `true`), `REPORT_DAILY_HOUR` (0–23, default `18` — hora local a partir da qual o tick envia o fechamento do dia), `REPORT_WEEKLY_DAY` (0=domingo … 6=sábado, default `1`=segunda, enviado no mesmo horário). Idempotência por período em `report_deliveries` (`UNIQUE(kind, period_key)`) + `dedup_key` na outbox: tick duplicado ou Core reiniciado nunca gera segunda mensagem.
 
-**Limitações encontradas na revisão:** o marcador de envio e a outbox não são gravados na mesma transação; uma interrupção entre eles pode suprimir o relatório. Recebimentos usam `charges.updated_at`, não a data financeira do pagamento. O total semanal “Cobrado” inclui tentativas `ERROR` e cobranças canceladas. O semanal agendado na segunda considera segunda até o momento do envio, não a semana anterior.
+**Entrega e métricas:** a reserva de período e a outbox nascem na mesma transação; `reserved_at` não significa entregue — só `delivered_at` após `SENT`. Recebimentos/estornos usam a data financeira do ledger. “Cobrado” significa emissão externa válida criada no período, sem `DRAFT`/`ERROR`/cancelada ou lançamento manual, e não duplica a mesma OS. O semanal sob demanda é parcial; o agendado fecha a semana anterior completa.
 
 **Baixa da nota (complemento da Fase 7):** `nota emitida OS <n> <número da NFS-e>` fecha a solicitação ativa como `AUTHORIZED` guardando o número (auditada); `cancelar nota OS <n>` marca `CANCELED` (cancela no emissor quando há id externo). Autorizadas e canceladas saem da lista `notas`.
 
@@ -271,7 +271,7 @@ npm run restore -- backups/arquivo.dump nome_banco_novo  # restaura em banco NOV
 
 O restore recusa o banco operacional, qualquer banco de sistema e **qualquer destino já existente** — nunca sobrescreve. O dump cobre só o schema `public` (domínio da aplicação); o schema `n8n` volta pelo bootstrap do workflow canônico.
 
-**Pendências operacionais:** os scripts de backup/restore ainda executam `source` no arquivo de ambiente, embora o formato do Compose não seja equivalente ao do shell (inclusive para `$`). O repositório não inclui agendamento/retenção de backup; a revisão encontrou um único dump local, de 04/11/2026. Backups externos não foram verificados.
+**Agendamento e retenção:** `scripts/backup-schedule.sh` é o ponto de chamada para cron/timer/CI já autorizado, mas o repositório não instala serviço no host. Configure `BACKUP_DIR` (preferencialmente volume externo com permissão 0700) e `BACKUP_RETENTION_DAYS`; o mecanismo só remove dumps regulares com o prefixo próprio, usa arquivo temporário + rename atômico e preserva o último válido. Backup externo real e recuperação no ambiente seguem dependentes da configuração local.
 
 ## Referência da API
 

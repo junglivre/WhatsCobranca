@@ -38,3 +38,26 @@ Escopo autorizado: correções do diagnóstico de 12/11/2026, via Codex `gpt-5.6
 ## Novos pedidos durante a execução
 
 Registrar aqui para revisão; não alterar o escopo silenciosamente.
+
+## Disposição da implementação (ciclo 12/11/2026)
+
+Implementado no código e migração `202611120001_correction_cycle`:
+
+- FIN-01, FIN-02, FIN-03, FIN-04, FIN-05 e FIN-06: worker com intenção/claim/lease, provider histórico habilitado separadamente, ledger imutável com origem explícita e eventos não associados reprocessáveis.
+- EST-01, EST-02, EST-03 e UX vinculada: agregação/validação SQL, retorno líquido comprovado, fila ambígua persistida e retomada na primeira mensagem após expiração.
+- EFI-01, SEG-01 e SEG-03: base Pix homologação, par mTLS obrigatório, OAuth/cancelamento normalizados, aliases sincronizados e proxy sem access log de query.
+- REL-01, REL-02 e REL-03: reserva/outbox atômicas, data financeira no ledger, emissão externa válida e semanal agendado fechado.
+- SEG-02 e OPS-01 a OPS-04: versões declaradas atualizadas, DNS runtime, parser seguro de env, isolamento explícito no verify e backup/retenção configuráveis.
+
+Dependências externas que permanecem `PENDING` por desenho: homologação Efí real com certificado/conta autorizados; configuração de destino externo e agendador de backup no ambiente. Portal Nacional direto, boleto Efí, multioperador e UI administrativa continuam fora do ciclo.
+
+## Prova integrada (coordenador, 12/11/2026)
+
+`npm run verify`: 63 cenários PASS + VERIFY PASS (exit 0) — integração PostgreSQL, cadeia HTTP local real, webhook n8n importado e ativo, recuperação após reinício do Core, isolamento do proxy, enforcement de unique/FK e restore exato em banco novo.
+
+Correções residuais do coordenador sobre a saída do Codex (todas cobertas pela prova):
+
+- Compilação: exports `MessageRow`/`queueReply` + `PreparedAudio`/`applyPreparedAudio` em `domain.ts`; `ChargeWorkRow.status`; shorthand `expiracao` em `efi.ts`.
+- `reset()` do teste: TRUNCATE incluía `financial_operations` e `financial_ledger` (FKs novas).
+- `billing-event-worker.ts`: notificação enfileirada só quando o status da cobrança muda de fato (RECEIVED sobre já-RECEIVED não notifica de novo).
+- Contratos de teste atualizados ao comportamento novo: datas futuras (10/12/2026; `paymentDate`/`horario` nos webhooks — sem data o evento vai a NEEDS_REVIEW por desenho), evento não associável permanece durável com retry (não finge processado), devolução Efí gera evento `REFUNDED` e estorna saldo no ledger.

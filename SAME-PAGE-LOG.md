@@ -1,5 +1,9 @@
 # Estado do projeto
 
+## Implementação do ciclo (12/11/2026 — aguardando prova integrada)
+
+O ciclo implementou a migração aditiva `202611120001_correction_cycle`, worker financeiro/ledger, correções de estoque, Efí, relatórios e operação isolada previstos em `RF-PLAN.md`. Isto é registro de implementação, **não** resultado de teste: nenhuma verificação, Compose, audit ou homologação real foi executada pelo executor. A homologação Efí e a cópia/agendamento externo de backup seguem dependências do ambiente.
+
 ## Revisão geral (2026-11-12)
 
 ### Situação observada
@@ -132,3 +136,10 @@ O cenário novo ("boleto com telefone...") travou com timeout de 20s no `tick()`
 
 - `npm run verify`: 61 cenários PASS + VERIFY PASS (commit cb14d50).
 - Homologação Asaas sandbox: boleto da OS 4 criado com link PDF real e enviado ao contato de teste após confirmação. Health ok naquele smoke.
+
+## Ciclo de correções 12/11/2026 — fechamento
+
+- Revisão IDS executada (gpt-5.6-terra, esforço xhigh): plano RF-PLAN.md com 6 rocks; objeções do Codex resolvidas no log acima. Implementação entregue pelo Codex; coordenação assumiu correções residuais até a prova verde.
+- Prova integrada do coordenador: `npm run verify` — 63 cenários PASS + VERIFY PASS (exit 0): integração PostgreSQL, HTTP real, n8n importado/ativo, recuperação de reinício, isolamento de proxy, unique/FK e restore em banco novo.
+- Correções residuais do coordenador (detalhe em RF-ISSUES.md, "Prova integrada"): compilação TS (exports de domínio, `ChargeWorkRow.status`, shorthand `expiracao`), TRUNCATE do reset com as duas tabelas financeiras novas, notificação de billing event somente quando o status muda, e testes alinhados ao contrato novo (datas futuras, `paymentDate`/`horario` obrigatórios para movimento financeiro, retry durável de evento não associável, devolução Efí como REFUNDED no ledger).
+- Pendências externas honestas: homologação Efí real (sem credenciais/certificado autorizados neste ciclo), destino externo e agendador do backup (dependem do ambiente). Commit de código aguarda o usuário.

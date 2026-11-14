@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — Ciclo de correções 12/11/2026
+
+- Worker financeiro durável com intenção/referência antes de I/O, claim/lease, reconciliação-only após resultado ambíguo e resposta final enfileirada antes de liberar FIFO.
+- Ledger financeiro imutável de recebimentos/estornos, parcelas por fora com origem explícita, eventos de gateway verificáveis, auditoria `SYSTEM` e legado sem data marcado para conciliação fora de períodos.
+- Providers históricos habilitados separadamente do padrão de novas cobranças (`BILLING_ENABLED_PROVIDERS`); autenticação Asaas/Efí constant-time e Efí corrigida para Pix homologação, mTLS obrigatório e estados oficiais de cancelamento.
+- Estoque agrega demanda/retorno no SQL, preserva quantidade em `numeric`, não restitui consumo legado não comprovado e mantém item ambíguo separado da fila até escolha.
+- Relatórios usam data financeira, emissão externa válida e reserva/outbox atômicas; `delivered_at` só é gravado após a outbox ser enviada.
+- Proxy resolve `core-api` em runtime e não registra access logs com query token. Backup/restore passam a ler `.env` sem executá-lo; há retenção segura e entrypoint de agendamento externo.
+- Prova integrada do coordenador: `npm run verify` VERIFY PASS (63 cenários PASS, exit 0) — integração PostgreSQL, HTTP real, n8n importado/ativo, recuperação de reinício, isolamento de proxy, unique/FK e restore exato em banco novo. Homologação Efí real e destino/agendador de backup externo permanecem pendentes por desenho (sem credenciais/ambiente neste ciclo).
+
 ## Não lançado — revisão geral de 12/11/2026
 
 - Diagnóstico priorizado em `SAME-PAGE-LOG.md`: durabilidade de cobranças, pagamentos parciais/confirmados, troca de gateway, estoque, Efí, segurança, relatórios e operação.
