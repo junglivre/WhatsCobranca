@@ -23,6 +23,9 @@ const schema = z.object({
   // manual); 'asaas' exige ASAAS_API_KEY e ASAAS_WEBHOOK_TOKEN (registry
   // falha no boot se faltar).
   BILLING_PROVIDER: z.enum(['none', 'manual', 'asaas', 'efi']).default('none'),
+  // Providers aceitos para webhooks e cobranças históricas. Vazio preserva o
+  // comportamento anterior: só o provider padrão (quando houver) é ligado.
+  BILLING_ENABLED_PROVIDERS: z.string().trim().default(''),
   ASAAS_API_KEY: z.string().trim().default(''),
   ASAAS_BASE_URL: z.string().url().default('https://api-sandbox.asaas.com/v3'),
   ASAAS_WEBHOOK_TOKEN: z.string().trim().default(''),
@@ -32,7 +35,7 @@ const schema = z.object({
   EFI_CLIENT_ID: z.string().trim().default(''),
   EFI_CLIENT_SECRET: z.string().trim().default(''),
   EFI_PIX_KEY: z.string().trim().default(''),
-  EFI_BASE_URL: z.string().url().default('https://api-sandbox.efipay.com.br'),
+  EFI_BASE_URL: z.string().url().default('https://pix-h.api.efipay.com.br'),
   EFI_WEBHOOK_TOKEN: z.string().trim().default(''),
   EFI_CERT_BASE64: z.string().trim().default(''),
   EFI_KEY_BASE64: z.string().trim().default(''),

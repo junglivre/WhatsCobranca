@@ -21,7 +21,7 @@ type OrderRow = {
 };
 type OrderItemRow = { id: string; raw_name: string; quantity: string; inventory_item_id: string | null; unit: string | null; item_name: string | null };
 type EventRow = { message_db_id: string };
-type MessageRow = {
+export type MessageRow = {
   id: string;
   message_id: string;
   operator_id: string;
@@ -283,7 +283,7 @@ async function audit(
   );
 }
 
-async function queueReply(
+export async function queueReply(
   tx: Tx,
   operatorId: string,
   sourceMessageId: string,
@@ -2932,4 +2932,65 @@ export async function processMessage(tx: Tx, event: EventRow, cfg: Config): Prom
   }
   if (await handleBillingStep(tx, message, payload, body, replyTo, cfg)) return;
   throw new Error(`UNKNOWN_PENDING_ACTION:${message.pending_action}`);
+}
+
+// ===== Fase 9: processamento de áudio fora da transação =====
+//
+// O financial-worker baixa mídia e chama Groq FORA da transação da inbox,
+// depois chama applyPreparedAudio para aplicar o resultado ao domínio.
+// Isso evita o mesmo problema de transação longa das cobranças.
+
+export type PreparedAudio =
+  | { kind: 'SKIP'; reason: string; body: string; suffix: string }
+  | { kind: 'APPLY'; transcription: string; extraction: Extraction }
+  | { kind: 'INTENT_IGNORED'; transcription: string; extraction: Extraction }
+  | { kind: 'FALLBACK'; transcription: string };
+
+export async function applyPreparedAudio(
+  tx: Tx, message: MessageRow, replyTo: string, prepared: PreparedAudio,
+): Promise<void> {
+  if (prepared.kind === 'SKIP') {
+    await skipAudio(tx, message, replyTo, prepared.reason, prepared.body, prepared.suffix);
+    return;
+  }
+  const transcription = prepared.transcription;
+  await tx.$executeRawUnsafe('UPDATE messages SET transcription=$2 WHERE id=$1::uuid', message.id, transcription);
+  const discardNotice = message.pending_action !== null ? 'A operação anterior foi descartada.\n' : '';
+
+  if (prepared.kind === 'FALLBACK') {
+    await saveState(tx, message.operator_id, 'CUSTOMER_NAME', { description: transcription }, null, replyTo);
+    await queueReply(tx, message.operator_id, message.id, replyTo,
+      `${discardNotice}Ouvi: "${transcription}"\nNão consegui interpretar automaticamente. Vamos pelo fluxo normal: qual é o nome do cliente?`, 'audio-fallback');
+    return;
+  }
+
+  const extraction = prepared.extraction;
+  if (prepared.kind === 'INTENT_IGNORED') {
+    await skipAudio(tx, message, replyTo, 'AUDIO_INTENT_IGNORED',
+      `${discardNotice}${audioIntro(transcription, extraction)}\nIsto não parece um atendimento. Envie novo e descreva o serviço, ou use ajuda.`, 'audio-intent');
+    return;
+  }
+
+  // kind === 'APPLY'
+  const extras: OrderExtras = {
+    serviceAmountCents: centsFromReal(extraction.serviceAmount),
+    materialAmountCents: centsFromReal(extraction.materialsAmount),
+    dueDate: extraction.dueDate ?? undefined,
+    materialsDraft: extraction.materials.length > 0
+      ? (await Promise.all(extraction.materials.map(async (material) => {
+        const quantity = material.quantity.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+        const matches = await searchMaterials(tx, material.name);
+        const inventoryItemId = matches.length === 1 ? matches[0]!.id : undefined;
+        return { rawName: material.name, quantity, ...(inventoryItemId ? { inventoryItemId } : {}) };
+      })))
+      : undefined,
+  };
+  const intro = `${discardNotice}${audioIntro(transcription, extraction)}`;
+  if (extraction.customerName) {
+    await resolveCustomer(tx, message.operator_id, message.id, replyTo,
+      extraction.serviceDescription ?? transcription, extraction.customerName, 'CREATE', extras, intro);
+    return;
+  }
+  await saveState(tx, message.operator_id, 'CUSTOMER_NAME', { description: extraction.serviceDescription ?? transcription, ...extras }, null, replyTo);
+  await queueReply(tx, message.operator_id, message.id, replyTo, `${intro}\nQual é o nome do cliente?`, 'audio-customer');
 }

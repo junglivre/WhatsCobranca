@@ -188,6 +188,9 @@ model Charge {
   pixQrUrl String? @map("pix_qr_url")
   boletoUrl String? @map("boleto_url")
   paidValueCents Int? @map("paid_value_cents")
+  issuedAt DateTime? @map("issued_at") @db.Timestamptz(6)
+  operationId String? @map("operation_id") @db.Uuid
+  reconciliationRequired Boolean @default(false) @map("reconciliation_required")
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
   @@index([serviceOrderId])
@@ -204,9 +207,59 @@ model BillingEvent {
   processed Boolean @default(false)
   receivedAt DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
   processedAt DateTime? @map("processed_at") @db.Timestamptz(6)
+  state String @default("PENDING")
+  attempts Int @default(0)
+  leaseUntil DateTime? @map("lease_until") @db.Timestamptz(6)
+  nextAttemptAt DateTime @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lastError String? @map("last_error")
   position BigInt @unique @default(autoincrement())
   @@unique([provider, providerEventId])
   @@map("billing_events")
+}
+
+// I/O externo nunca acontece dentro da transação da inbox. Esta tabela é a
+// intenção durável, com claim/lease e referência estável para reconciliação.
+model FinancialOperation {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceMessageId String @unique @map("source_message_id") @db.Uuid
+  webhookEventId String @unique @map("webhook_event_id") @db.Uuid
+  operatorId String @map("operator_id") @db.Uuid
+  kind String
+  provider String?
+  chargeId String? @map("charge_id") @db.Uuid
+  invoiceId String? @map("invoice_id") @db.Uuid
+  externalReference String @unique @map("external_reference")
+  payload Json
+  state String @default("PENDING")
+  attempts Int @default(0)
+  leaseUntil DateTime? @map("lease_until") @db.Timestamptz(6)
+  nextAttemptAt DateTime @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lastError String? @map("last_error")
+  reconciliationOnly Boolean @default(false) @map("reconciliation_only")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  finishedAt DateTime? @map("finished_at") @db.Timestamptz(6)
+  @@map("financial_operations")
+}
+
+// O sinal econômico vem de direction; valueCents nunca é negativo. Linhas de
+// legado sem evidência de data ficam explícitas e não entram em períodos.
+model FinancialLedgerEntry {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  serviceOrderId String @map("service_order_id") @db.Uuid
+  chargeId String? @map("charge_id") @db.Uuid
+  direction String
+  valueCents Int @map("value_cents")
+  financialAt DateTime? @map("financial_at") @db.Timestamptz(6)
+  origin String
+  economicKey String @unique @map("economic_key")
+  provider String?
+  providerPaymentId String? @map("provider_payment_id")
+  sourceMessageId String? @map("source_message_id") @db.Uuid
+  billingEventId String? @unique @map("billing_event_id") @db.Uuid
+  actorId String @map("actor_id") @db.Uuid
+  metadata Json @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@map("financial_ledger")
 }
 
 model Invoice {
@@ -227,7 +280,9 @@ model ReportDelivery {
   id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   kind      String
   periodKey String   @map("period_key")
-  sentAt    DateTime @default(now()) @map("sent_at") @db.Timestamptz(6)
+  reservedAt DateTime @default(now()) @map("reserved_at") @db.Timestamptz(6)
+  outboundMessageId String? @unique @map("outbound_message_id") @db.Uuid
+  deliveredAt DateTime? @map("delivered_at") @db.Timestamptz(6)
 
   @@unique([kind, periodKey])
   @@map("report_deliveries")
@@ -244,6 +299,7 @@ model StockMovement {
   operatorId      String        @map("operator_id") @db.Uuid
   sourceMessageId String?       @map("source_message_id") @db.Uuid
   createdAt       DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  provenance      String        @default("PROVEN")
   @@index([inventoryItemId, createdAt])
   @@map("stock_movements")
 }

@@ -2,6 +2,24 @@
 // payloads ou status crus de um provedor. Cada adapter traduz o provedor
 // para este vocabulário. Para adicionar um provedor novo, implemente esta
 // interface + registre em registry.ts (ver README, seção Integrações).
+import { timingSafeEqual } from 'node:crypto';
+
+/** Compara token de webhook sem revelar prefixo/tamanho útil ao caller. */
+export function safeSecretEqual(provided: string | undefined, expected: string): boolean {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** Conversão decimal exata usada somente nos adapters (reais -> centavos). */
+export function decimalToCents(value: unknown): number | null {
+  const raw = typeof value === 'number' ? String(value) : typeof value === 'string' ? value.trim() : '';
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) return null;
+  const [whole, fraction = ''] = raw.split('.');
+  const cents = Number(`${whole}${fraction.padEnd(2, '0')}`);
+  return Number.isSafeInteger(cents) && cents > 0 && cents <= 2_147_483_647 ? cents : null;
+}
 
 /** Métodos de cobrança suportados pelo domínio (espelho do CHECK no banco). */
 export type ChargeMethod = 'PIX' | 'BOLETO' | 'CASH' | 'EXTERNAL_PIX';
@@ -53,6 +71,9 @@ export interface CreatedCharge {
 export interface ProviderChargeSnapshot {
   status: ChargeStatus;
   paidValueCents: number | null;
+  /** Dados só presentes quando o gateway realmente os comprova. */
+  financialAt?: string | null;
+  paymentReference?: string | null;
 }
 
 export interface PixData {
@@ -68,6 +89,19 @@ export type BillingEventType =
   | 'CREATED' | 'CONFIRMED' | 'RECEIVED' | 'OVERDUE'
   | 'CANCELED' | 'REFUNDED' | 'PARTIAL' | 'OTHER';
 
+export type FinancialEvent = {
+  direction: 'RECEIPT' | 'REFUND';
+  /** Sempre positivo e já convertido para centavos pelo adapter. */
+  valueCents: number;
+  /** ISO-8601 fornecido pelo gateway; nunca é inferido pelo domínio. */
+  occurredAt: string;
+  /** Efeito econômico estável (Pix e2e, id de devolução, pagamento Asaas). */
+  economicKey: string;
+  paymentReference: string;
+  /** Snapshots cumulativos inserem somente a diferença positiva no worker. */
+  semantics: 'DELTA' | 'CUMULATIVE';
+};
+
 export interface NormalizedBillingEvent {
   /** ID único do evento NO PROVEDOR — base da deduplicação. */
   providerEventId: string;
@@ -75,6 +109,7 @@ export interface NormalizedBillingEvent {
   type: BillingEventType;
   paidValueCents?: number | null;
   occurredAt?: string | null;
+  financial?: FinancialEvent | null;
 }
 
 export class WebhookAuthError extends Error {
@@ -88,6 +123,14 @@ export class ProviderTimeoutError extends Error {
   constructor(message = 'provider call timed out') {
     super(message);
     this.name = 'ProviderTimeoutError';
+  }
+}
+
+/** Rejeição determinística: a data/método está fora do contrato do gateway. */
+export class ProviderValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderValidationError';
   }
 }
 

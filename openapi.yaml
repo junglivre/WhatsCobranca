@@ -72,15 +72,17 @@ paths:
     post:
       summary: Persist authenticated billing-provider events (Asaas, Efí)
       description: >-
-        Public route behind the webhook-only proxy; only the configured
-        BILLING_PROVIDER is served (other names return 404). Authentication is
+        Public route behind the webhook-only proxy; only providers explicitly
+        enabled for historical operations are served (other names return 404).
+        Authentication is
         provider-specific: Asaas sends the `asaas-access-token` header; Efí sends
         no custom headers, so its URL is registered with `?token=<EFI_WEBHOOK_TOKEN>&ignorar=`
         (`ignorar=` stops Efí from appending `/pix` to the path) and the token is
         compared in constant time. One call may carry several events (Efí `pix[]`);
         all are persisted in one transaction and deduplicated by
         (provider, provider_event_id). Bodies with no charge event (registration
-        test, refunds, sent Pix) return 200 with ignored=true. Processing is
+        test and sent Pix) return 200 with ignored=true. Confirmed refunds are
+        normalized as immutable financial ledger entries. Processing is
         asynchronous in /automation/tick; 200 acknowledges persistence only.
       parameters:
         - in: path
@@ -113,7 +115,7 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
-        '404': {description: Provider is not the configured BILLING_PROVIDER}
+        '404': {description: Provider is not enabled for historical operations}
         '500': {description: Persistence unavailable; sender may retry}
   /automation/tick:
     post:

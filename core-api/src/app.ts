@@ -5,8 +5,10 @@ import { config, type Config } from './config.js';
 import { dailyCloseBody, mondayOf, processMessage, queueNotice, spNowParts, weeklyReportBody } from './domain.js';
 import { validHmac, sendWaha, SendFailure } from './waha.js';
 import { formatMoney, osLabel } from './types.js';
-import { getBillingProvider } from './providers/registry.js';
+import { getBillingProviders } from './providers/registry.js';
 import { WebhookAuthError, type NormalizedBillingEvent } from './providers/billing/types.js';
+import { processFinancialOperations } from './financial-worker.js';
+import { processBillingEventQueue } from './billing-event-worker.js';
 
 type OperatorRow = { id: string };
 type IdentityRow = { operator_id: string };
@@ -89,13 +91,18 @@ async function ensureOperator(prisma: PrismaClient, cfg: Config): Promise<void> 
   ))[0];
   if (!operator) throw new Error('POC operator was not created');
 
-  for (const value of [cfg.OPERATOR_LID, cfg.OPERATOR_PHONE]) {
-    await prisma.$executeRawUnsafe(
-      'INSERT INTO whatsapp_identities(value, operator_id) VALUES($1, $2::uuid) ON CONFLICT(value) DO NOTHING',
-      value,
-      operator.id,
-    );
-  }
+  // A allowlist é um espelho literal da configuração atual. Remover aliases
+  // antigos revoga acesso imediatamente sem tocar em mensagens/auditoria já
+  // vinculadas ao operador.
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe('DELETE FROM whatsapp_identities WHERE operator_id=$1::uuid', operator.id);
+    for (const value of new Set([cfg.OPERATOR_LID, cfg.OPERATOR_PHONE])) {
+      await tx.$executeRawUnsafe(
+        `INSERT INTO whatsapp_identities(value, operator_id) VALUES($1, $2::uuid)
+         ON CONFLICT(value) DO UPDATE SET operator_id=EXCLUDED.operator_id`, value, operator.id,
+      );
+    }
+  });
 }
 
 async function processPendingEvent(prisma: PrismaClient, cfg: Config): Promise<boolean> {
@@ -129,8 +136,14 @@ async function processPendingEvent(prisma: PrismaClient, cfg: Config): Promise<b
     await tx.$executeRawUnsafe('SAVEPOINT message_processing');
     try {
       await processMessage(tx, event, cfg);
+      const deferred = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `SELECT id FROM financial_operations
+          WHERE webhook_event_id=$1::uuid AND state IN ('PENDING','LEASED','UNCERTAIN') LIMIT 1`, event.id,
+      );
       await tx.$executeRawUnsafe(
-        "UPDATE webhook_events SET state='PROCESSED', processed_at=now(), last_error=NULL WHERE id=$1::uuid",
+        deferred[0]
+          ? "UPDATE webhook_events SET state='WAITING_EXTERNAL', last_error=NULL WHERE id=$1::uuid"
+          : "UPDATE webhook_events SET state='PROCESSED', processed_at=now(), last_error=NULL WHERE id=$1::uuid",
         event.id,
       );
       return true;
@@ -190,6 +203,9 @@ async function deliver(prisma: PrismaClient, cfg: Config): Promise<number> {
         "UPDATE outbound_messages SET status='SENT', provider_message_id=$2, sent_at=now(), lease_until=NULL WHERE id=$1::uuid",
         outbound.id,
         result.id,
+      );
+      await prisma.$executeRawUnsafe(
+        'UPDATE report_deliveries SET delivered_at=now() WHERE outbound_message_id=$1::uuid AND delivered_at IS NULL', outbound.id,
       );
       sent += 1;
     } catch (error) {
@@ -354,29 +370,35 @@ async function sweepOverdueCharges(prisma: PrismaClient, cfg: Config, operator: 
 async function runScheduledReports(prisma: PrismaClient, cfg: Config, operator: OperatorRow): Promise<number> {
   if (cfg.REPORTS_ENABLED !== 'true') return 0;
   const { date, hour, weekday } = spNowParts();
+  const reserve = async (kind: 'DAILY_CLOSE' | 'WEEKLY', periodKey: string, body: string): Promise<boolean> =>
+    prisma.$transaction(async (tx) => {
+      const delivery = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO report_deliveries(kind, period_key) VALUES($1, $2)
+         ON CONFLICT(kind, period_key) DO NOTHING RETURNING id`, kind, periodKey,
+      );
+      if (!delivery[0]) return false;
+      const outbound = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+        `INSERT INTO outbound_messages(operator_id, correlation_message_id, reply_to, body, dedup_key)
+         VALUES($1::uuid, NULL, $2, $3, $4)
+         ON CONFLICT(dedup_key) DO UPDATE SET dedup_key=EXCLUDED.dedup_key
+         RETURNING id`, operator.id, cfg.OPERATOR_LID, body, `report:${kind}:${periodKey}`,
+      );
+      if (!outbound[0]) throw new Error('REPORT_OUTBOX_NOT_RESERVED');
+      await tx.$executeRawUnsafe('UPDATE report_deliveries SET outbound_message_id=$2::uuid WHERE id=$1::uuid', delivery[0].id, outbound[0].id);
+      return true;
+    });
   let queued = 0;
   if (hour >= cfg.REPORT_DAILY_HOUR) {
-    const inserted = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
-      `INSERT INTO report_deliveries(kind, period_key) VALUES('DAILY_CLOSE', $1)
-       ON CONFLICT (kind, period_key) DO NOTHING RETURNING id`,
-      date,
-    );
-    if (inserted[0]) {
-      await queueNotice(prisma, operator.id, cfg.OPERATOR_LID, await dailyCloseBody(prisma, date), `report:DAILY_CLOSE:${date}`);
-      queued += 1;
-    }
+    if (await reserve('DAILY_CLOSE', date, await dailyCloseBody(prisma, date))) queued += 1;
   }
   if (weekday === cfg.REPORT_WEEKLY_DAY && hour >= cfg.REPORT_DAILY_HOUR) {
-    const weekKey = `W:${mondayOf(date)}`;
-    const inserted = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
-      `INSERT INTO report_deliveries(kind, period_key) VALUES('WEEKLY', $1)
-       ON CONFLICT (kind, period_key) DO NOTHING RETURNING id`,
-      weekKey,
-    );
-    if (inserted[0]) {
-      await queueNotice(prisma, operator.id, cfg.OPERATOR_LID, await weeklyReportBody(prisma, mondayOf(date), date), `report:WEEKLY:${weekKey}`);
-      queued += 1;
-    }
+    const currentMonday = new Date(`${mondayOf(date)}T12:00:00Z`);
+    currentMonday.setUTCDate(currentMonday.getUTCDate() - 7);
+    const from = currentMonday.toISOString().slice(0, 10);
+    currentMonday.setUTCDate(currentMonday.getUTCDate() + 6);
+    const to = currentMonday.toISOString().slice(0, 10);
+    const weekKey = `W:${from}`;
+    if (await reserve('WEEKLY', weekKey, await weeklyReportBody(prisma, from, to))) queued += 1;
   }
   return queued;
 }
@@ -385,7 +407,7 @@ export async function buildApp(overrides: Partial<Config> = {}) {
   const cfg = { ...config(), ...overrides };
   // Fail-fast no boot: BILLING_PROVIDER=asaas sem credencial é erro de
   // operação — o serviço não sobe pela metade.
-  const billing = getBillingProvider(cfg);
+  const billingProviders = getBillingProviders(cfg);
   const prisma = new PrismaClient();
   const app = Fastify({ logger: false, bodyLimit: cfg.BODY_LIMIT_BYTES });
 
@@ -453,7 +475,8 @@ export async function buildApp(overrides: Partial<Config> = {}) {
   // UNIQUE(provider, provider_event_id), processamento assíncrono no tick.
   app.post('/webhooks/billing/:provider', async (request, reply) => {
     const { provider } = request.params as { provider: string };
-    if (!billing || provider !== billing.name) {
+    const webhookProvider = billingProviders.get(provider);
+    if (!webhookProvider) {
       return reply.code(404).send({ error: 'unknown_provider' });
     }
     let parsed: unknown = null;
@@ -467,7 +490,7 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     }
     let events: NormalizedBillingEvent[];
     try {
-      events = billing.validateAndNormalizeWebhook(request.headers, request.query as Record<string, string | string[] | undefined>, parsed);
+      events = webhookProvider.validateAndNormalizeWebhook(request.headers, request.query as Record<string, string | string[] | undefined>, parsed);
     } catch (error) {
       if (error instanceof WebhookAuthError) {
         return reply.code(401).send({ error: 'invalid_token' });
@@ -496,6 +519,8 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     }
     let processed = 0;
     let sent = await deliver(prisma, cfg);
+    const operationsBefore = await processFinancialOperations(prisma, cfg);
+    if (operationsBefore > 0) sent += await deliver(prisma, cfg);
     for (let index = 0; index < 20; index += 1) {
       if (!(await processPendingEvent(prisma, cfg))) break;
       processed += 1;
@@ -508,13 +533,14 @@ export async function buildApp(overrides: Partial<Config> = {}) {
     );
     const operator = operators[0];
     if (!operator) throw new Error('POC operator was not created');
-    const billingProcessed = await processBillingEvents(prisma, cfg, operator);
+    const billingProcessed = await processBillingEventQueue(prisma, cfg);
     const overdue = await sweepOverdueCharges(prisma, cfg, operator);
     const reports = await runScheduledReports(prisma, cfg, operator);
-    if (billingProcessed > 0 || overdue > 0 || reports > 0) {
+    const operationsAfter = await processFinancialOperations(prisma, cfg);
+    if (billingProcessed > 0 || overdue > 0 || reports > 0 || operationsAfter > 0) {
       sent += await deliver(prisma, cfg);
     }
-    return { processed, sent, billingProcessed, overdue, reports };
+    return { processed, sent, billingProcessed, overdue, reports, operations: operationsBefore + operationsAfter };
   });
 
   app.addHook('onClose', async () => prisma.$disconnect());

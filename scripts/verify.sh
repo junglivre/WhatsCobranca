@@ -17,6 +17,12 @@ export GROQ_API_KEY=verify-isolated-key GROQ_BASE_URL=http://groq-test:8091
 export GROQ_STT_MODEL=whisper-large-v3 GROQ_LLM_MODEL=llama-3.3-70b-versatile
 export WAHA_MEDIA_MAX_BYTES=65536
 export N8N_ENCRYPTION_KEY=verify_n8n_encryption_key_0123456789
+# Neutraliza explicitamente qualquer provider/segredo herdado do shell. A
+# prova HTTP isolada só liga fakes configurados pelo próprio cenário.
+export BILLING_PROVIDER=none BILLING_ENABLED_PROVIDERS=
+export ASAAS_API_KEY= ASAAS_BASE_URL=https://api-sandbox.asaas.com/v3 ASAAS_WEBHOOK_TOKEN=
+export EFI_CLIENT_ID= EFI_CLIENT_SECRET= EFI_PIX_KEY= EFI_BASE_URL=https://pix-h.api.efipay.com.br EFI_WEBHOOK_TOKEN= EFI_CERT_BASE64= EFI_KEY_BASE64=
+export INVOICE_PROVIDER=none REPORTS_ENABLED=false REPORT_DAILY_HOUR=18 REPORT_WEEKLY_DAY=1
 compose=(docker compose --env-file /dev/null -f docker-compose.yml -f docker-compose.verify.yml --project-name whatscobranca_verify)
 # Recreate only the isolated test network/containers, keeping its volumes.
 "${compose[@]}" down --remove-orphans

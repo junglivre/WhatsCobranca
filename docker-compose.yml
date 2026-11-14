@@ -34,13 +34,14 @@ services:
       GROQ_LLM_MODEL: ${GROQ_LLM_MODEL:-llama-3.3-70b-versatile}
       WAHA_MEDIA_MAX_BYTES: ${WAHA_MEDIA_MAX_BYTES:-16777216}
       BILLING_PROVIDER: ${BILLING_PROVIDER:-none}
+      BILLING_ENABLED_PROVIDERS: ${BILLING_ENABLED_PROVIDERS:-}
       ASAAS_API_KEY: ${ASAAS_API_KEY:-}
       ASAAS_BASE_URL: ${ASAAS_BASE_URL:-https://api-sandbox.asaas.com/v3}
       ASAAS_WEBHOOK_TOKEN: ${ASAAS_WEBHOOK_TOKEN:-}
       EFI_CLIENT_ID: ${EFI_CLIENT_ID:-}
       EFI_CLIENT_SECRET: ${EFI_CLIENT_SECRET:-}
       EFI_PIX_KEY: ${EFI_PIX_KEY:-}
-      EFI_BASE_URL: ${EFI_BASE_URL:-https://api-sandbox.efipay.com.br}
+      EFI_BASE_URL: ${EFI_BASE_URL:-https://pix-h.api.efipay.com.br}
       EFI_WEBHOOK_TOKEN: ${EFI_WEBHOOK_TOKEN:-}
       EFI_CERT_BASE64: ${EFI_CERT_BASE64:-}
       EFI_KEY_BASE64: ${EFI_KEY_BASE64:-}
@@ -67,7 +68,7 @@ services:
     command: ["psql", "-v", "ON_ERROR_STOP=1", "-c", "CREATE SCHEMA IF NOT EXISTS n8n;"]
     depends_on: {postgres: {condition: service_healthy}}
   n8n-init:
-    image: n8nio/n8n:1.112.5
+    image: n8nio/n8n:2.47.5
     restart: "no"
     environment: &n8n_env
       DB_TYPE: postgresdb
@@ -92,7 +93,7 @@ services:
       - n8n import:workflow --input=/workflows/poc1-tick.json && n8n update:workflow --id=WhatsCobrancaPoc1Tick --active=true
     depends_on: {n8n-schema: {condition: service_completed_successfully}}
   n8n:
-    image: n8nio/n8n:1.112.5
+    image: n8nio/n8n:2.47.5
     restart: unless-stopped
     environment:
       <<: *n8n_env

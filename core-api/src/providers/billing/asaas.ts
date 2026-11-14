@@ -30,7 +30,7 @@ import type {
   BillingProvider, ChargeCustomerInput, ChargeStatus, CreateChargeInput,
   CreatedCharge, NormalizedBillingEvent, PixData, ProviderChargeSnapshot,
 } from './types.js';
-import { MissingFiscalIdError, ProviderTimeoutError, WebhookAuthError } from './types.js';
+import { decimalToCents, MissingFiscalIdError, ProviderTimeoutError, safeSecretEqual, WebhookAuthError } from './types.js';
 import type { BillingEventType } from './types.js';
 
 const TIMEOUT_MS = 10_000;
@@ -132,7 +132,7 @@ export class AsaasBillingProvider implements BillingProvider {
     );
     return {
       status: mapStatus(body.status),
-      paidValueCents: typeof body.value === 'number' ? Math.round(body.value * 100) : null,
+      paidValueCents: decimalToCents(body.value),
     };
   }
 
@@ -168,11 +168,11 @@ export class AsaasBillingProvider implements BillingProvider {
   ): NormalizedBillingEvent[] {
     const header = headers['asaas-access-token'];
     const token = Array.isArray(header) ? header[0] : header;
-    if (token !== this.cfg.ASAAS_WEBHOOK_TOKEN) throw new WebhookAuthError();
+    if (!safeSecretEqual(token, this.cfg.ASAAS_WEBHOOK_TOKEN)) throw new WebhookAuthError();
     const body = rawBody as {
       id?: unknown;
       event?: unknown;
-      payment?: { id?: unknown; value?: unknown } | null;
+      payment?: { id?: unknown; value?: unknown; paymentDate?: unknown; clientPaymentDate?: unknown; confirmedDate?: unknown; dateCreated?: unknown } | null;
     } | null;
     const paymentId = typeof body?.payment?.id === 'string' ? body.payment.id : null;
     if (!paymentId) return []; // evento não relacionado a cobrança: caller responde 200 e ignora
@@ -191,12 +191,26 @@ export class AsaasBillingProvider implements BillingProvider {
     const providerEventId = typeof body?.id === 'string' && body.id.length > 0
       ? body.id
       : `${eventName}:${paymentId}`; // dedup determinístico quando o provedor omite o id do evento
-    const value = body?.payment?.value;
+    const value = decimalToCents(body?.payment?.value);
+    const occurredAtRaw = body?.payment?.clientPaymentDate ?? body?.payment?.paymentDate ?? body?.payment?.confirmedDate;
+    const occurredAt = typeof occurredAtRaw === 'string' && !Number.isNaN(Date.parse(occurredAtRaw)) ? occurredAtRaw : null;
+    const financial = (type === 'RECEIVED' || type === 'REFUNDED') && value !== null && occurredAt
+      ? {
+        direction: type === 'RECEIVED' ? 'RECEIPT' as const : 'REFUND' as const,
+        valueCents: value,
+        occurredAt,
+        economicKey: `asaas:${providerEventId}:${type.toLowerCase()}`,
+        paymentReference: paymentId,
+        semantics: 'DELTA' as const,
+      }
+      : null;
     return [{
       providerEventId,
       providerChargeId: paymentId,
       type,
-      paidValueCents: typeof value === 'number' ? Math.round(value * 100) : null,
+      paidValueCents: value,
+      occurredAt,
+      financial,
     }];
   }
 }

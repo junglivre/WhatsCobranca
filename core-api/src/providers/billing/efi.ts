@@ -10,15 +10,14 @@
 // Mapa de status Efí (cob.status) → interno:
 //   ATIVA               → PENDING
 //   CONCLUIDA           → RECEIVED
-//   REMOVIDA_BY_USUARIO → CANCELED
-//   REMOVIDA_BY_PSP     → CANCELED
+//   REMOVIDA_PELO_USUARIO_RECEBEDOR → CANCELED
+//   REMOVIDA_PELO_PSP                → CANCELED
 //
 // Auth: OAuth2 client_credentials (POST /oauth/token, Basic) com cache em
 // memória. Produção Pix exige mTLS: informe EFI_CERT_BASE64/EFI_KEY_BASE64
 // (certificado ICP-Brasil) e o transport usa client TLS. Webhook: a Efí não
 // envia headers customizados — a URL cadastrada deve levar ?token=<segredo>
 // (EFI_WEBHOOK_TOKEN), validado aqui em comparação constant-time.
-import { timingSafeEqual } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest, type RequestOptions } from 'node:https';
 import type { Config } from '../../config.js';
@@ -26,7 +25,7 @@ import type {
   BillingProvider, ChargeCustomerInput, ChargeStatus, CreateChargeInput,
   CreatedCharge, NormalizedBillingEvent, PixData, ProviderChargeSnapshot,
 } from './types.js';
-import { ProviderTimeoutError, UnsupportedMethodError, WebhookAuthError } from './types.js';
+import { decimalToCents, ProviderTimeoutError, ProviderValidationError, safeSecretEqual, UnsupportedMethodError, WebhookAuthError } from './types.js';
 
 const TIMEOUT_MS = 30_000;
 /** BCB: txid de cob é 26–35 caracteres alfanuméricos. */
@@ -38,27 +37,22 @@ export function efiTxid(externalReference: string): string {
 }
 
 /** Segundos até o fim do dia de vencimento (SP), entre 1h e 30d. */
-function expirationFor(dueDate: string): number {
+function expirationFor(dueDate: string): number | null {
   const end = new Date(`${dueDate}T23:59:59-03:00`).getTime();
-  return Math.min(2_592_000, Math.max(3_600, Math.ceil((end - Date.now()) / 1000)));
+  const seconds = Math.ceil((end - Date.now()) / 1000);
+  return seconds >= 3_600 && seconds <= 2_592_000 ? seconds : null;
 }
 
 function mapStatus(status: string): ChargeStatus {
   switch (status) {
     case 'CONCLUIDA': return 'RECEIVED';
-    case 'REMOVIDA_BY_USUARIO':
-    case 'REMOVIDA_BY_PSP': return 'CANCELED';
+    case 'REMOVIDA_PELO_USUARIO_RECEBEDOR':
+    case 'REMOVIDA_PELO_PSP': return 'CANCELED';
     default: return 'PENDING';
   }
 }
 
 const centsToValue = (cents: number) => (cents / 100).toFixed(2);
-const valueToCents = (value: unknown): number | null => {
-  if (typeof value !== 'string' && typeof value !== 'number') return null;
-  const cents = Math.round(Number(value) * 100);
-  return Number.isFinite(cents) && cents > 0 ? cents : null;
-};
-
 type Json = Record<string, unknown>;
 
 /** POST/PUT/PATCH/GET JSON sobre node:https — client TLS opcional (mTLS). */
@@ -102,6 +96,9 @@ export class EfiBillingProvider implements BillingProvider {
     this.mTls = cfg.EFI_CERT_BASE64 && cfg.EFI_KEY_BASE64
       ? { cert: Buffer.from(cfg.EFI_CERT_BASE64, 'base64').toString('utf8'), key: Buffer.from(cfg.EFI_KEY_BASE64, 'base64').toString('utf8') }
       : null;
+    if (!this.mTls || !this.mTls.cert.includes('BEGIN CERTIFICATE') || !this.mTls.key.includes('BEGIN')) {
+      throw new Error('EFI_CERT_BASE64 e EFI_KEY_BASE64 precisam conter um par PEM válido quando Efí está habilitada');
+    }
   }
 
   private base(): URL {
@@ -112,9 +109,9 @@ export class EfiBillingProvider implements BillingProvider {
   private async accessToken(): Promise<string> {
     if (this.token && this.token.expiresAt > Date.now() + 60_000) return this.token.value;
     const basic = Buffer.from(`${this.cfg.EFI_CLIENT_ID}:${this.cfg.EFI_CLIENT_SECRET}`).toString('base64');
-    const body = 'grant_type=client_credentials&scope=cob.write%20cob.read%20pix.read%20webhook.write%20webhook.read';
+    const body = JSON.stringify({ grant_type: 'client_credentials' });
     const response = await efiFetch(this.base(), '/oauth/token', 'POST', {
-      authorization: `Basic ${basic}`, 'content-type': 'application/x-www-form-urlencoded',
+      authorization: `Basic ${basic}`, 'content-type': 'application/json',
     }, body, TIMEOUT_MS, this.mTls);
     const token = typeof response.body?.access_token === 'string' ? response.body.access_token : null;
     const expiresIn = Number(response.body?.expires_in);
@@ -145,9 +142,13 @@ export class EfiBillingProvider implements BillingProvider {
     if (input.method !== 'PIX') {
       throw new UnsupportedMethodError('Boleto não suportado pelo adapter Efí — use pix ou troque BILLING_PROVIDER.');
     }
+    const expiration = expirationFor(input.dueDate);
+    if (expiration === null) {
+      throw new ProviderValidationError('Vencimento Pix Efí deve ficar entre uma hora e trinta dias; escolha uma data suportada.');
+    }
     const txid = efiTxid(input.externalReference);
     const response = await this.call('PUT', `/v2/cob/${txid}`, {
-      calendario: { expiracao: expirationFor(input.dueDate) },
+      calendario: { expiracao: expiration },
       valor: { original: centsToValue(input.valueCents) },
       chave: this.cfg.EFI_PIX_KEY,
       solicitacaoPagador: input.description.slice(0, 140),
@@ -185,7 +186,7 @@ export class EfiBillingProvider implements BillingProvider {
   }
 
   async cancelCharge(providerChargeId: string): Promise<void> {
-    const response = await this.call('PATCH', `/v2/cob/${providerChargeId}`, { status: 'REMOVIDA_BY_USUARIO' });
+    const response = await this.call('PATCH', `/v2/cob/${providerChargeId}`, { status: 'REMOVIDA_PELO_USUARIO_RECEBEDOR' });
     if (response.status !== 204 && response.status !== 200 && response.status !== 201) {
       throw new Error(`EFI_CANCEL_FAILED(${response.status})`);
     }
@@ -237,9 +238,7 @@ export class EfiBillingProvider implements BillingProvider {
   ): NormalizedBillingEvent[] {
     const provided = Array.isArray(query.token) ? query.token[0] : query.token;
     const expected = this.cfg.EFI_WEBHOOK_TOKEN;
-    const a = Buffer.from(String(provided ?? ''));
-    const b = Buffer.from(expected);
-    if (!expected || a.length !== b.length || !timingSafeEqual(a, b)) {
+    if (!safeSecretEqual(provided, expected)) {
       throw new WebhookAuthError('invalid efi webhook token');
     }
     const entries: unknown[] = typeof rawBody === 'object' && rawBody !== null && 'pix' in rawBody
@@ -252,13 +251,39 @@ export class EfiBillingProvider implements BillingProvider {
       const txid = field('txid');
       const endToEndId = field('endToEndId');
       const refunds = field('devolucoes');
-      if (Array.isArray(refunds) && refunds.length > 0) continue;
       if (typeof txid !== 'string' || typeof endToEndId !== 'string') continue;
+      if (Array.isArray(refunds) && refunds.length > 0) {
+        for (const refund of refunds) {
+          const record = typeof refund === 'object' && refund !== null ? refund as Record<string, unknown> : {};
+          const refundId = typeof record.id === 'string' ? record.id : typeof record.rtrId === 'string' ? record.rtrId : null;
+          const dateRaw = record.horario ?? record.data ?? field('horario');
+          const occurredAt = typeof dateRaw === 'string' && !Number.isNaN(Date.parse(dateRaw)) ? dateRaw : null;
+          const cents = decimalToCents(record.valor);
+          if (!refundId || (record.status !== undefined && record.status !== 'DEVOLVIDO')) continue;
+          events.push({
+            type: 'REFUNDED', providerChargeId: txid, providerEventId: `refund:${refundId}`,
+            paidValueCents: cents, occurredAt,
+            financial: cents !== null && occurredAt ? {
+              direction: 'REFUND', valueCents: cents, occurredAt,
+              economicKey: `efi:refund:${refundId}`, paymentReference: endToEndId, semantics: 'DELTA',
+            } : null,
+          });
+        }
+        continue;
+      }
+      const cents = decimalToCents(field('valor'));
+      const dateRaw = field('horario');
+      const occurredAt = typeof dateRaw === 'string' && !Number.isNaN(Date.parse(dateRaw)) ? dateRaw : null;
       events.push({
         type: 'RECEIVED',
         providerChargeId: txid,
         providerEventId: endToEndId,
-        paidValueCents: valueToCents(field('valor')),
+        paidValueCents: cents,
+        occurredAt,
+        financial: cents !== null && occurredAt ? {
+          direction: 'RECEIPT', valueCents: cents, occurredAt,
+          economicKey: `efi:receipt:${endToEndId}`, paymentReference: endToEndId, semantics: 'DELTA',
+        } : null,
       });
     }
     return events;

@@ -300,7 +300,7 @@ async function beginOrderToMaterials(description: string, customerName: string, 
 }
 async function reset() {
   // Only the disposable *_test database supplied by verify.sh can reach this operation.
-  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, billing_events, charges, invoices, report_deliveries, customer_provider_refs, service_orders, inventory_items, customers');
+  await prisma.$executeRawUnsafe('TRUNCATE audit_logs, outbound_messages, webhook_events, messages, conversation_states, service_order_items, stock_movements, billing_events, charges, invoices, report_deliveries, financial_operations, financial_ledger, customer_provider_refs, service_orders, inventory_items, customers');
   await prisma.$executeRawUnsafe('ALTER SEQUENCE service_order_number_seq RESTART WITH 1');
   deliveries.length = 0;
   providerAttempts.length = 0;
@@ -577,6 +577,8 @@ const asaasFake = http.createServer((request, response) => {
 const EFI_CLIENT_TEST_ID = 'efi-client-id';
 const EFI_CLIENT_TEST_SECRET = 'efi-client-secret';
 const EFI_TEST_WEBHOOK_TOKEN = 'integration-efi-webhook-token';
+const EFI_TEST_CERT_BASE64 = Buffer.from('-----BEGIN CERTIFICATE-----\nTEST-ONLY\n-----END CERTIFICATE-----\n').toString('base64');
+const EFI_TEST_KEY_BASE64 = Buffer.from('-----BEGIN PRIVATE KEY-----\nTEST-ONLY\n-----END PRIVATE KEY-----\n').toString('base64');
 type EfiCob = { txid: string; status: string; value: number; chave: string; solicitacao: string };
 const efiCobs: EfiCob[] = [];
 const efiCalls: Array<{ method: string; path: string; body: unknown }> = [];
@@ -603,8 +605,7 @@ const efiFake = http.createServer((request, response) => {
   request.on('end', () => {
     const raw = Buffer.concat(chunks).toString('utf8');
     let body: Record<string, unknown> | null = null;
-    // /oauth/token é urlencoded — JSON só nas rotas de cob.
-    if (raw && !(request.method === 'POST' && path === '/oauth/token')) {
+    if (raw) {
       try {
         body = JSON.parse(raw) as Record<string, unknown>;
       } catch {
@@ -617,7 +618,7 @@ const efiFake = http.createServer((request, response) => {
       if (request.headers.authorization !== `Basic ${basic}`) {
         return efiReply(response, 401, { error: 'invalid_client' });
       }
-      if (!raw.includes('grant_type=client_credentials')) {
+      if (body?.grant_type !== 'client_credentials') {
         return efiReply(response, 400, { error: 'unsupported_grant_type' });
       }
       return efiReply(response, 200, { access_token: `efi-token-${efiTokenRequests}`, token_type: 'Bearer', expires_in: 3600 });
@@ -664,7 +665,7 @@ const efiFake = http.createServer((request, response) => {
     if (request.method === 'PATCH') {
       const cob = efiCobs.find((candidate) => candidate.txid === txid);
       if (!cob) return efiReply(response, 404, { error: 'cob não encontrada' });
-      cob.status = 'REMOVIDA_BY_USUARIO';
+      cob.status = 'REMOVIDA_PELO_USUARIO_RECEBEDOR';
       return efiReply(response, 204, null);
     }
     return efiReply(response, 404, { error: 'unhandled' });
@@ -678,6 +679,8 @@ const efiEnv = () => ({
   EFI_PIX_KEY: 'pix-key-efi',
   EFI_BASE_URL: efiUrl,
   EFI_WEBHOOK_TOKEN: EFI_TEST_WEBHOOK_TOKEN,
+  EFI_CERT_BASE64: EFI_TEST_CERT_BASE64,
+  EFI_KEY_BASE64: EFI_TEST_KEY_BASE64,
 });
 const efiCallsTo = (method: string, pathPrefix: string) =>
   efiCalls.filter((call) => call.method === method && call.path.startsWith(pathPrefix));
@@ -747,10 +750,10 @@ async function invoices(): Promise<InvoiceRow[]> {
        FROM invoices ORDER BY created_at, id`,
   );
 }
-type BillingEventRow = { provider: string; provider_event_id: string; event_type: string; charge_id: string | null; processed: boolean };
+type BillingEventRow = { provider: string; provider_event_id: string; event_type: string; charge_id: string | null; processed: boolean; state: string | null };
 async function billingEvents(): Promise<BillingEventRow[]> {
   return prisma.$queryRawUnsafe<BillingEventRow[]>(
-    'SELECT provider, provider_event_id, event_type, charge_id::text AS charge_id, processed FROM billing_events ORDER BY position',
+    'SELECT provider, provider_event_id, event_type, charge_id::text AS charge_id, processed, state FROM billing_events ORDER BY position',
   );
 }
 // Notificações espontâneas do tick (sem mensagem de correlação).
@@ -792,7 +795,7 @@ async function confirmOrder(description: string, customerName: string, value: st
   return order;
 }
 // 'cobrar OS <n> pix <vencimento>' + 'sim' — retorna o resumo e a resposta final.
-async function cobrarPixConfirm(osNumber: number, due = '10/11/2026') {
+async function cobrarPixConfirm(osNumber: number, due = '10/12/2026') {
   const summary = await inbound(`cobrar OS ${osNumber} pix ${due}`);
   const done = await inbound('sim');
   await pending(null);
@@ -1198,7 +1201,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(providerAttempts.length, 1);
   }],
   ['audio happy path: STT, LLM extraction, cadastro, due_date and confirmation', async () => {
-    await groqControl('/scenario', { stt: 'Troca da bomba de agua do poo', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Carlos Pereira', service_description: 'Troca da bomba de agua', service_amount: 150.5, materials_amount: null, due_date: '2026-11-10' } });
+    await groqControl('/scenario', { stt: 'Troca da bomba de agua do poo', llm: { intent: 'REGISTRAR_SERVICO', customer_name: 'Carlos Pereira', service_description: 'Troca da bomba de agua', service_amount: 150.5, materials_amount: null, due_date: '2026-12-10' } });
     const audioId = id('audio-happy');
     await ingest(audioId, null, audioMedia(audioId));
     await tick();
@@ -1213,12 +1216,12 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.deepEqual(mediaDownloads.map((download) => download.path), [`/api/files/${settings.WAHA_SESSION}/${audioId}.oga`]);
     const created = await inbound('sim');
     assert.match(created.text, /R\$ 150,50/);
-    assert.match(created.text, /Vence: 10\/11\/2026/);
+    assert.match(created.text, /Vence: 10\/12\/2026/);
     assert.match(created.text, /Carlos Pereira/);
     const [order] = await orders();
     assert.equal(order.description, 'Troca da bomba de agua');
     assert.equal(order.amount_cents, 15050);
-    assert.equal(order.due_date instanceof Date ? order.due_date.toISOString().slice(0, 10) : order.due_date, '2026-11-10');
+    assert.equal(order.due_date instanceof Date ? order.due_date.toISOString().slice(0, 10) : order.due_date, '2026-12-10');
     assert.equal(order.status, 'AGUARDANDO_CONFIRMACAO');
     assert.deepEqual(await audits(created.id).then((rows) => rows.map((row) => [row.entity_type, row.action])), [['customer', 'CREATE'], ['service_order', 'CREATE']]);
     const confirmed = await inbound('sim');
@@ -2162,13 +2165,13 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await restartAppWith(asaasEnv());
     const order = await confirmOrder('Instalar tomada', 'Cliente Pix', '150');
     assert.equal(order.number, 1);
-    const summary = await inbound('cobrar OS 1 pix 10/11/2026');
-    assert.match(summary.text, /Cobrança Pix de R\$ 150,00 para Cliente Pix \(OS 000001\), vencimento 10\/11\/2026\. Confirma\?/);
+    const summary = await inbound('cobrar OS 1 pix 10/12/2026');
+    assert.match(summary.text, /Cobrança Pix de R\$ 150,00 para Cliente Pix \(OS 000001\), vencimento 10\/12\/2026\. Confirma\?/);
     await pending('CHARGE_CONFIRM');
     const done = await inbound('sim');
     await pending(null);
     const charge = (await charges())[0]!;
-    assert.match(done.text, /Cobrança criada: OS 000001 · Pix · R\$ 150,00 · vencimento 10\/11\/2026\./);
+    assert.match(done.text, /Cobrança criada: OS 000001 · Pix · R\$ 150,00 · vencimento 10\/12\/2026\./);
     assert.match(done.text, /Pix copia-e-cola:\n00020126pix-copia-e-cola-/);
     assert.equal(charge.status, 'PENDING');
     assert.equal(charge.provider, 'asaas');
@@ -2197,7 +2200,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     const order = await confirmOrder('Servico webhook', 'Cliente Webhook', '150');
     await cobrarPixConfirm(order.number);
     const charge = (await charges())[0]!;
-    const event = { id: 'evt-received-1', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    const event = { id: 'evt-received-1', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150, paymentDate: '2026-11-12' } };
     const accepted = await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN);
     assert.equal(accepted.status, 200, accepted.text);
     assert.deepEqual(JSON.parse(accepted.text), { accepted: true });
@@ -2216,7 +2219,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal((await charges())[0]!.status, 'RECEIVED');
     assert.equal((await notices()).length, 1);
     // Evento NOVO do mesmo tipo para cobrança já RECEIVED: processado, no-op.
-    const again = { id: 'evt-received-2', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    const again = { id: 'evt-received-2', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150, paymentDate: '2026-11-12' } };
     assert.equal((await billingWebhook('asaas', again, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
     await tick();
     assert.equal((await billingEvents()).length, 2);
@@ -2228,7 +2231,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     const order = await confirmOrder('Servico token', 'Cliente Token', '150');
     await cobrarPixConfirm(order.number);
     const charge = (await charges())[0]!;
-    const event = { id: 'evt-bad-token', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    const event = { id: 'evt-bad-token', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150, paymentDate: '2026-11-12' } };
     for (const token of ['wrong-token', '']) {
       const response = await billingWebhook('asaas', event, token);
       assert.equal(response.status, 401, token);
@@ -2244,13 +2247,16 @@ const scenarios: Array<[string, () => Promise<void>]> = [
   }],
   ['webhook de cobrança desconhecida persiste o evento, não quebra e não notifica', async () => {
     await restartAppWith(asaasEnv());
-    const event = { id: 'evt-unknown-charge', event: 'PAYMENT_RECEIVED', payment: { id: 'pay_inexistente', value: 42 } };
+    const event = { id: 'evt-unknown-charge', event: 'PAYMENT_RECEIVED', payment: { id: 'pay_inexistente', value: 42, paymentDate: '2026-11-12' } };
     assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
     await tick();
     const events = await billingEvents();
     assert.equal(events.length, 1);
     assert.equal(events[0]!.event_type, 'RECEIVED');
-    assert.equal(events[0]!.processed, true);
+    // Contrato Fase 6: evento não associável fica durável com nova tentativa
+    // (corrida webhook x criação da cobrança); não finge que foi processado.
+    assert.equal(events[0]!.processed, false);
+    assert.equal(events[0]!.state, 'PENDING');
     assert.equal(events[0]!.charge_id, null);
     assert.equal((await charges()).length, 0);
     assert.equal((await notices()).length, 0);
@@ -2296,7 +2302,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(charge.paid_value_cents, 15000);
     assert.equal((await notices()).length, 0);
     // Webhook RECEIVED posterior do provedor: no-op (não rebaixa, não notifica).
-    const event = { id: 'evt-late-received', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150 } };
+    const event = { id: 'evt-late-received', event: 'PAYMENT_RECEIVED', payment: { id: charge.provider_charge_id, value: 150, paymentDate: '2026-11-12' } };
     assert.equal((await billingWebhook('asaas', event, ASAAS_TEST_WEBHOOK_TOKEN)).status, 200);
     await tick();
     assert.equal((await charges())[0]!.status, 'RECEIVED');
@@ -2341,7 +2347,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await restartAppWith(asaasEnv());
     const order = await confirmOrder('Servico timeout', 'Cliente Timeout', '150');
     asaasCreateThen500 = true; // a cobrança é gravada no provedor, mas a resposta se perde
-    const summary = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    const summary = await inbound(`cobrar OS ${order.number} pix 10/12/2026`);
     assert.match(summary.text, /Confirma\?/);
     const done = await inbound('sim');
     assert.match(done.text, /Cobrança criada: OS 000001/);
@@ -2409,7 +2415,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     const third = await confirmOrder('Servico duplo', 'Cliente Duplo', '100'); // OS 3
     await cobrarPixConfirm(third.number);
     const active = await inbound('cobrar OS 3 pix');
-    assert.match(active.text, /Já há cobrança ativa para a OS 000003: PIX R\$ 100,00 vence 10\/11\/2026 \(PENDING\)/);
+    assert.match(active.text, /Já há cobrança ativa para a OS 000003: PIX R\$ 100,00 vence 10\/12\/2026 \(PENDING\)/);
     await pending(null);
     assert.equal((await charges()).length, 1);
     assert.equal(asaasCallsTo('POST', '/payments').length, 1);
@@ -2461,7 +2467,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     await restartAppWith(asaasEnv());
     const order = await confirmOrder('Servico fiscal', 'Cliente Fiscal', '150');
     asaasRequireFiscalId = true; // reproduz a rejeição real do sandbox Asaas
-    const summary = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    const summary = await inbound(`cobrar OS ${order.number} pix 10/12/2026`);
     assert.match(summary.text, /Confirma\?/);
     const failed = await inbound('sim');
     await pending(null);
@@ -2480,7 +2486,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(customerRow!.cpf_cnpj, '52998224725', 'documento gravado sem pontuação');
     assert.deepEqual((await audits(cpfReply.id)).map((entry) => [entry.entity_type, entry.action]), [['customer', 'SET_CPF_CNPJ']]);
     // Retry: updateCustomer (PUT) sincroniza o documento e a cobrança é criada.
-    const retry = await inbound(`cobrar OS ${order.number} pix 10/11/2026`);
+    const retry = await inbound(`cobrar OS ${order.number} pix 10/12/2026`);
     assert.match(retry.text, /Confirma\?/);
     const done = await inbound('sim');
     await pending(null);
@@ -2795,7 +2801,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.equal(failed.status, 'ERROR');
     assert.equal(failed.provider_charge_id, null);
     assert.equal(efiCobs.length, 0, 'boleto nunca cria cob');
-    // Pix + cancelamento: PATCH única para REMOVIDA_BY_USUARIO.
+    // Pix + cancelamento: PATCH única para REMOVIDA_PELO_USUARIO_RECEBEDOR.
     await cobrarPixConfirm(order.number);
     const txid = (await charges())[1]!.provider_charge_id!;
     await inbound(`cancelar cobrança OS ${order.number}`);
@@ -2805,7 +2811,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     assert.match(canceled.text, /Cobrança da OS 000001 cancelada\./);
     assert.equal((await charges())[1]!.status, 'CANCELED');
     assert.equal(efiCallsTo('PATCH', `/v2/cob/${txid}`).length, 1);
-    assert.equal(efiCobs[0]!.status, 'REMOVIDA_BY_USUARIO');
+    assert.equal(efiCobs[0]!.status, 'REMOVIDA_PELO_USUARIO_RECEBEDOR');
     // Sem cobrança ativa: novo cancelamento não fala com o provedor.
     assert.match((await inbound(`cancelar cobrança OS ${order.number}`)).text, /Não há cobrança ativa/);
     assert.equal(efiCallsTo('PATCH', '/v2/cob/').length, 1);
@@ -2826,7 +2832,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
         { endToEndId: 'E0000000020261107bbbb', txid: txidTwo, valor: '90.00', horario: '2026-11-07T10:00:01.000Z' },
         {
           endToEndId: 'E0000000020261107cccc', txid: txidOne, valor: '150.00',
-          devolucoes: [{ id: 'D1', rtrId: 'D0000000020261107cccc', valor: '150.00', status: 'DEVOLVIDO' }],
+          devolucoes: [{ id: 'D1', rtrId: 'D0000000020261107cccc', valor: '150.00', status: 'DEVOLVIDO', horario: '2026-11-07T11:00:00.000Z' }],
         },
         { endToEndId: 'E0000000020261107dddd', valor: '20.00', horario: '2026-11-07T10:00:02.000Z' },
       ],
@@ -2834,21 +2840,25 @@ const scenarios: Array<[string, () => Promise<void>]> = [
     const url = `/webhooks/billing/efi?token=${EFI_TEST_WEBHOOK_TOKEN}&ignorar=%2Fpix`;
     const sent = await request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch) });
     assert.equal(sent.status, 200, sent.text);
+    // Devolução agora é movimento financeiro (REFUND no ledger), não dinheiro
+    // entrando: gera evento REFUNDED próprio e estorna o saldo da OS 1.
     assert.deepEqual((await billingEvents()).map((event) => [event.provider_event_id, event.event_type]), [
       ['E0000000020261107aaaa', 'RECEIVED'],
       ['E0000000020261107bbbb', 'RECEIVED'],
+      ['refund:D1', 'REFUNDED'],
     ]);
     await tick();
-    assert.deepEqual((await charges()).map((charge) => [charge.status, charge.paid_value_cents]), [['RECEIVED', 15000], ['RECEIVED', 9000]]);
+    assert.deepEqual((await charges()).map((charge) => [charge.status, charge.paid_value_cents]), [['REFUNDED', 0], ['RECEIVED', 9000]]);
     assert.deepEqual((await notices()).map((notice) => notice.body), [
       'Cobrança OS 000001 recebida: R$ 150,00',
       'Cobrança OS 000002 recebida: R$ 90,00',
+      'Cobrança OS 000001 foi estornada; saldo financeiro recalculado.',
     ]);
-    // Reenvio do mesmo lote: dedup por endToEndId, sem novo aviso.
+    // Reenvio do mesmo lote: dedup por endToEndId/rtrId, sem novo aviso.
     assert.equal((await request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch) })).status, 200);
     await tick();
-    assert.equal((await billingEvents()).length, 2);
-    assert.equal((await notices()).length, 2);
+    assert.equal((await billingEvents()).length, 3);
+    assert.equal((await notices()).length, 3);
     // Notificação de teste do cadastro, `info` de recebimento recusado e corpo
     // vazio: 200 sem persistir nada.
     for (const body of [{}, { info: [{ status: 'RECEBIMENTO_RECUSADO', valor: '0.10' }] }, { pix: [] }]) {
@@ -2856,7 +2866,7 @@ const scenarios: Array<[string, () => Promise<void>]> = [
       assert.equal(ignored.status, 200);
       assert.match(ignored.text, /"ignored":true/);
     }
-    assert.equal((await billingEvents()).length, 2);
+    assert.equal((await billingEvents()).length, 3);
   }],
   ['efi cadastro do webhook: URL com token e ignorar=, header skip-mTLS e HTTPS obrigatório', async () => {
     await restartAppWith(efiEnv());
